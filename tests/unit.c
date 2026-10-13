@@ -159,6 +159,92 @@ static void verify_dense_paint_output(void) {
     installed_palette = -1;
 }
 
+/* Interpret cursor movement and glyphs, so shorter cursor commands must still
+   draw a complete frame at the correct terminal positions. */
+static void apply_frame_glyphs(const App *a, uint32_t *screen) {
+    const Output *o = &a->output;
+    int x = 0, y = 0;
+    for (size_t i = 0; i < o->len;) {
+        if ((unsigned char)o->bytes[i] == 27) {
+            assert(i+1 < o->len);
+            if (o->bytes[i+1] == ']') {
+                i += 2;
+                while (i+1 < o->len && !(o->bytes[i] == 27 && o->bytes[i+1] == '\\')) ++i;
+                assert(i+1 < o->len);
+                i += 2;
+            } else {
+                assert(o->bytes[i+1] == '[');
+                i += 2;
+                int params[8] = {0}, count = 0;
+                while (i < o->len && (isdigit((unsigned char)o->bytes[i]) || o->bytes[i] == ';')) {
+                    if (o->bytes[i] == ';') { ++count; assert(count < 8); }
+                    else params[count] = params[count]*10+o->bytes[i]-'0';
+                    ++i;
+                }
+                assert(i < o->len);
+                char command = o->bytes[i++];
+                if (command == 'H') { y = params[0]-1; x = params[1]-1; }
+                else if (command == 'C') x += params[0] ? params[0] : 1;
+                else assert(command == 'm' || command == 'J' || command == 'K');
+            }
+        } else if ((unsigned char)o->bytes[i] < 32) ++i;
+        else {
+            int consumed;
+            uint32_t cp = decode_one_utf8((const unsigned char *)o->bytes+i, &consumed);
+            assert(i+(size_t)consumed <= o->len);
+            i += (size_t)consumed;
+            if (y >= 0 && y < a->garden.picture_rows) {
+                assert(x >= 0 && x < a->garden.cols);
+                screen[y*a->garden.cols+x] = cp;
+            }
+            ++x;
+        }
+    }
+    for (int i = 0; i < a->garden.cols*a->garden.picture_rows; ++i)
+        assert(screen[i] == a->garden.last[i].glyph);
+}
+
+static void verify_mature_renewal_paint_output(RenewalMode renewal) {
+    App a = {0};
+    a.config.hud = 1;
+    a.config.utf8 = 1;
+    a.config.color = COLOR_TRUE;
+    a.config.renewal = renewal;
+    a.indexed_colors = 1;
+    a.rng = 743927;
+    make_keys(&a);
+    assert(garden_resize(&a,155,61));
+    for (int step = 0; step < 9000; ++step) {
+        garden_step(&a.garden);
+        garden_ecology_step(&a);
+    }
+    uint32_t *screen = calloc((size_t)a.garden.cols*a.garden.picture_rows,sizeof(*screen));
+    assert(screen);
+    app_render(&a);
+    apply_frame_glyphs(&a,screen);
+    installed_palette = a.output_palette;
+    size_t bytes = 0;
+    for (int frame = 0; frame < 120; ++frame) {
+        garden_step(&a.garden); garden_ecology_step(&a);
+        garden_step(&a.garden); garden_ecology_step(&a);
+        garden_trace_fade(&a.garden);
+        for (int paint = 0; paint < 3; ++paint)
+            garden_touch(&a.garden,(float)(10+(frame*5+paint*8)%(a.garden.w-20)),
+                (float)(10+frame%(a.garden.h-20)),.35f,0);
+        a.output.len = 0;
+        a.next_output_at = 0;
+        app_render(&a);
+        assert(!a.output.failed);
+        apply_frame_glyphs(&a,screen);
+        bytes += a.output.len;
+    }
+    printf("mature renewal %d with painting: %zu bytes/frame\n",renewal,bytes/120);
+    assert(bytes/120 < app_output_rate(&a)/30);
+    free(screen);
+    garden_dispose(&a.garden);
+    installed_palette = -1;
+}
+
 int main(void) {
     App a={0};
     a.config.hud=1;
@@ -231,6 +317,8 @@ int main(void) {
     verify_exit_input();
     verify_nonblocking_render();
     verify_dense_paint_output();
+    verify_mature_renewal_paint_output(RENEWAL_GENTLE);
+    verify_mature_renewal_paint_output(RENEWAL_ACTIVE);
     float off_change = mature_change(RENEWAL_OFF);
     float gentle_change = mature_change(RENEWAL_GENTLE);
     float active_change = mature_change(RENEWAL_ACTIVE);

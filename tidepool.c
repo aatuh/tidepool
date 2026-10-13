@@ -1005,6 +1005,16 @@ static void app_footer(App *a, Output *o) {
     output_str(o, line);
 }
 
+static uint32_t stable_palette_color(uint32_t before, uint32_t after) {
+    /* Hold a one-shade change until it accumulates. Stabilize both colors
+       before choosing the glyph, so tiny changes cannot alternate a solid
+       space with a half-block and force an otherwise invisible repaint. */
+    if ((before & after & PALETTE_INDEXED) &&
+        abs((int)(before & ~PALETTE_INDEXED)-(int)(after & ~PALETTE_INDEXED)) <= 1)
+        return before;
+    return after;
+}
+
 static int colors_close(uint32_t before, uint32_t after, ColorMode mode) {
     if ((before | after) & PALETTE_INDEXED) return before == after;
     if (mode != COLOR_TRUE) return before == after;
@@ -1060,6 +1070,15 @@ static void app_render(App *a) {
             if (a->indexed_colors) {
                 fg = PALETTE_INDEXED | (uint32_t)(16+palette_level(g->v[top], g->trace[top]));
                 bg = PALETTE_INDEXED | (uint32_t)(16+palette_level(g->v[bottom], g->trace[bottom]));
+                if (prev->glyph != UINT32_MAX) {
+                    if (fg == bg) {
+                        bg = stable_palette_color(prev->bg,bg);
+                        fg = bg;
+                    } else {
+                        fg = stable_palette_color(prev->fg,fg);
+                        bg = stable_palette_color(prev->bg,bg);
+                    }
+                }
             }
             uint32_t glyph = 0x2580; /* U+2580 upper-half block */
             if (fg == bg) glyph = ' '; /* A solid cell needs only its background. */
@@ -1086,7 +1105,16 @@ static void app_render(App *a) {
                 colors_close(prev->bg, bg, a->config.color))
                 continue;
             if (last_written_row != y || last_written_col != x-1) {
-                output_fmt(o, "\033[%d;%dH", y+1, x+1);
+                if (last_written_row == y) {
+                    int gap = x-last_written_col-1;
+                    if (gap == 1) output_str(o,"\033[C");
+                    else output_fmt(o,"\033[%dC",gap);
+                } else output_fmt(o, "\033[%d;%dH", y+1, x+1);
+            }
+            if (glyph != ' ' && fg != current_fg && bg != current_bg &&
+                (fg & bg & PALETTE_INDEXED)) {
+                output_fmt(o,"\033[38;5;%u;48;5;%um",fg & ~PALETTE_INDEXED,bg & ~PALETTE_INDEXED);
+                current_fg = fg; current_bg = bg;
             }
             if (glyph != ' ' && fg != current_fg) {
                 emit_color(o, fg, a->config.color, 0); current_fg = fg;
