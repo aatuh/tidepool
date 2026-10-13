@@ -27,9 +27,11 @@
 
 #define PI 3.14159265358979323846
 #define MAX_KEYS 64
-#define OUTPUT_CAP 8192
-#define OUTPUT_WRITE_CHUNK 4096
+#define OUTPUT_WRITE_CHUNK 32768
 #define OUTPUT_BYTES_PER_SECOND 256000
+#define OUTPUT_INDEXED_BYTES_PER_SECOND 1024000
+#define PALETTE_LEVELS 32
+#define PALETTE_INDEXED 0x80000000u
 #define MIN_COLS 24
 #define MIN_ROWS 8
 #define MAX_GRAZERS 10
@@ -68,15 +70,16 @@ typedef struct { uint32_t cp; float xn, yn; char utf8[5]; } Key;
 typedef struct {
     float x, y, direction, hunger;
 } Grazer;
-typedef struct { uint32_t fg, bg, glyph; int urgent; } Cell;
-typedef struct { char bytes[OUTPUT_CAP]; size_t len; int failed; } Output;
+typedef struct { uint32_t fg, bg, glyph; } Cell;
+typedef struct { char *bytes; size_t capacity, len; int failed; } Output;
 typedef struct {
     int cols, rows, w, h, picture_rows;
     float *u, *v, *next_u, *next_v, *trace;
     Cell *last;
     uint32_t *key_overlay;
     int redraw;
-    int render_cursor, urgent_cursor;
+    char *frame_bytes;
+    size_t frame_capacity;
 } Garden;
 
 typedef struct {
@@ -104,6 +107,9 @@ typedef struct {
     Output output;
     size_t output_offset;
     double next_output_at;
+    int indexed_colors, palette_report_entry, palette_report_count;
+    int output_palette;
+    char control_bytes[1024];
 } App;
 
 static volatile sig_atomic_t stop_requested = 0;
@@ -113,6 +119,8 @@ static int saved_tio_valid = 0;
 static int saved_output_flags = -1;
 static int terminal_active = 0;
 static int terminal_mouse = 0;
+static int terminal_palette_saved = 0;
+static int installed_palette = -1;
 
 static void signal_stop(int signo) { (void)signo; stop_requested = 1; }
 static void signal_winch(int signo) { (void)signo; winch_requested = 1; }
@@ -164,6 +172,12 @@ static void terminal_restore(void) {
         /* Discard unfinished frames so reset sequences fit even if the PTY's
            reader stays paused until after this process exits. */
         (void)tcflush(STDOUT_FILENO, TCOFLUSH);
+        /* CAN also cancels a control sequence interrupted by resize/exit. */
+        (void)write_all("\030", 1);
+        if (terminal_palette_saved) {
+            (void)write_all("\033[#Q", 4);
+            terminal_palette_saved = 0;
+        }
         const char *cleanup = terminal_mouse ?
             "\033[?1006l\033[?1002l\033[?1000l\033[0m\033[?25h\033[?1049l" :
             "\033[0m\033[?25h\033[?1049l";
@@ -240,7 +254,7 @@ static float random_unit(App *a) {
 
 static void output_bytes(Output *o, const char *bytes, size_t n) {
     if (o->failed) return;
-    if (n > OUTPUT_CAP - o->len) { o->failed = 1; return; }
+    if (n > o->capacity - o->len) { o->failed = 1; return; }
     memcpy(o->bytes + o->len, bytes, n);
     o->len += n;
 }
@@ -255,14 +269,14 @@ static void output_fmt(Output *o, const char *fmt, ...) {
 }
 
 static void app_flush_output(App *a) {
-    if (!a->output.len || seconds_now() < a->next_output_at) return;
+    if (!a->output.len) return;
     size_t left = a->output.len - a->output_offset;
     size_t chunk = left < OUTPUT_WRITE_CHUNK ? left : OUTPUT_WRITE_CHUNK;
     ssize_t n = write(STDOUT_FILENO, a->output.bytes + a->output_offset, chunk);
     if (n > 0) {
         a->output_offset += (size_t)n;
-        a->next_output_at = seconds_now() + (double)n / OUTPUT_BYTES_PER_SECOND;
         if (a->output_offset == a->output.len) {
+            if (a->indexed_colors) installed_palette = a->output_palette;
             a->output.len = 0;
             a->output_offset = 0;
         }
@@ -307,7 +321,9 @@ static uint32_t encode_color(RGB c, ColorMode mode) {
 }
 static void emit_color(Output *o, uint32_t c, ColorMode m, int bg) {
     if (m == COLOR_MONO) return;
-    if (m == COLOR_TRUE)
+    if (c & PALETTE_INDEXED)
+        output_fmt(o, "\033[%d;5;%um", bg ? 48 : 38, c & ~PALETTE_INDEXED);
+    else if (m == COLOR_TRUE)
         output_fmt(o, "\033[%d;2;%u;%u;%um", bg ? 48 : 38,
             (c >> 16) & 255u, (c >> 8) & 255u, c & 255u);
     else if (m == COLOR_256)
@@ -326,10 +342,16 @@ static RGB mix_rgb(RGB a, RGB b, float t) {
     return c;
 }
 
-static RGB palette_sample(int palette, float v, float trace) {
+static int palette_level(float v, float trace) {
+    float t = sqrtf(clampf(v / .44f + trace * .22f, 0.f, 1.f));
+    return (int)(t*PALETTE_LEVELS+.5f);
+}
+
+static RGB palette_gradient(int palette, int level) {
     const Palette *p = &palettes[palette];
     static const float at[6] = {0.f, .18f, .36f, .54f, .76f, 1.f};
-    float t = sqrtf(clampf(v / .44f + trace * .22f, 0.f, 1.f));
+    /* Nearby samples share colors, avoiding a new SGR command for every cell. */
+    float t = (float)level/PALETTE_LEVELS;
     for (int i = 0; i < 5; ++i) {
         if (t <= at[i+1])
             return mix_rgb(p->stops[i], p->stops[i+1], (t-at[i]) / (at[i+1]-at[i]));
@@ -337,9 +359,23 @@ static RGB palette_sample(int palette, float v, float trace) {
     return p->stops[5];
 }
 
+static RGB palette_sample(int palette, float v, float trace) {
+    return palette_gradient(palette, palette_level(v, trace));
+}
+
+static void output_palette(Output *o, int palette) {
+    output_str(o, "\033]4");
+    for (int level = 0; level <= PALETTE_LEVELS; ++level) {
+        RGB c = palette_gradient(palette, level);
+        output_fmt(o, ";%d;rgb:%02x/%02x/%02x", 16+level, c.r, c.g, c.b);
+    }
+    output_str(o, "\033\\");
+}
+
 static void garden_dispose(Garden *g) {
     free(g->u); free(g->v); free(g->next_u); free(g->next_v);
     free(g->trace); free(g->last); free(g->key_overlay);
+    free(g->frame_bytes);
     memset(g, 0, sizeof(*g));
 }
 
@@ -539,8 +575,6 @@ static void garden_touch(Garden *g, float px, float py, float force, int quiet) 
     const float r = clampf(fminf(g->w, g->h)*.080f, 3.2f, 7.0f);
     const int reach = (int)ceilf(2.2f*r);
     int cx = (int)lroundf(px), cy = (int)lroundf(py);
-    g->urgent_cursor = ((cy-reach+g->h*3)%g->h/2)*g->cols +
-        (cx-reach+g->w*3)%g->w;
     for (int dy = -reach; dy <= reach; ++dy) {
         int y = (cy+dy+g->h*3) % g->h;
         for (int dx = -reach; dx <= reach; ++dx) {
@@ -557,7 +591,6 @@ static void garden_touch(Garden *g, float px, float py, float force, int quiet) 
                 g->u[i] *= 1.f-.38f*z;
             }
             g->trace[i] = fmaxf(g->trace[i], .30f*z);
-            g->last[(y/2)*g->cols+x].urgent = 1;
         }
     }
 }
@@ -647,7 +680,9 @@ static int garden_resize(App *a, int cols, int rows) {
     if (cols < MIN_COLS || rows < MIN_ROWS) {
         garden_dispose(g);
         a->grazer_count = 0;
-        a->output.len = a->output_offset = 0;
+        a->output = (Output){a->control_bytes, sizeof(a->control_bytes), 0, 0};
+        a->output_offset = 0;
+        a->next_output_at = 0;
         a->resized = 1;
         return 1;
     }
@@ -665,15 +700,17 @@ static int garden_resize(App *a, int cols, int rows) {
     newg.trace = calloc(n, sizeof(float));
     newg.last = malloc(pixels*sizeof(Cell));
     newg.key_overlay = calloc(pixels, sizeof(uint32_t));
+    /* Each cell needs at most a cursor, two RGB controls, and a UTF-8 glyph. */
+    newg.frame_capacity = pixels*64 + 4096;
+    newg.frame_bytes = malloc(newg.frame_capacity);
     if (!newg.u || !newg.v || !newg.next_u || !newg.next_v ||
-        !newg.trace || !newg.last || !newg.key_overlay) {
+        !newg.trace || !newg.last || !newg.key_overlay || !newg.frame_bytes) {
         garden_dispose(&newg); return 0;
     }
     for (size_t i = 0; i < pixels; ++i) {
         newg.last[i].fg = UINT32_MAX;
         newg.last[i].bg = UINT32_MAX;
         newg.last[i].glyph = UINT32_MAX;
-        newg.last[i].urgent = 0;
     }
     newg.redraw = 1;
     if (g->w) {
@@ -710,7 +747,9 @@ static int garden_resize(App *a, int cols, int rows) {
     }
     garden_dispose(g);
     *g = newg;
-    a->output.len = a->output_offset = 0;
+    a->output = (Output){g->frame_bytes, g->frame_capacity, 0, 0};
+    a->output_offset = 0;
+    a->next_output_at = 0;
     garden_make_overlay(a);
     a->last_footer[0] = 0;
     a->resized = 1;
@@ -833,6 +872,14 @@ static void app_input_byte(App *a, unsigned char byte) {
                 int b, x, y;
                 if (sscanf(a->escape, "<%d;%d;%d", &b, &x, &y) == 3)
                     app_mouse(a, b, x, y, byte == 'm');
+            } else if (byte == 'Q') {
+                unsigned int entry, count;
+                int consumed = 0;
+                if (sscanf(a->escape, "?%2u;%2u#Q%n", &entry, &count, &consumed) == 2 &&
+                    consumed == a->escape_length && entry <= 10 && count <= 10 && entry <= count) {
+                    a->palette_report_entry = (int)entry;
+                    a->palette_report_count = (int)count;
+                }
             }
             a->input_state = 0;
         }
@@ -883,6 +930,38 @@ static void app_read_input(App *a) {
     if (a->input_state == 1 && seconds_now() - a->esc_at > .10) stop_requested = 1;
 }
 
+static int terminal_palette_report(App *a) {
+    a->palette_report_entry = -1;
+    if (!write_all("\033[#R", 4)) return 0;
+    double deadline = seconds_now() + .12;
+    while (!stop_requested && a->palette_report_entry < 0) {
+        double remaining = deadline - seconds_now();
+        if (remaining <= 0) return 0;
+        fd_set input;
+        FD_ZERO(&input); FD_SET(STDIN_FILENO, &input);
+        struct timeval tv = {0, (suseconds_t)(remaining*1e6)};
+        int ready = select(STDIN_FILENO+1, &input, NULL, NULL, &tv);
+        if (ready > 0) app_read_input(a);
+        else if (ready < 0 && errno != EINTR) return 0;
+    }
+    return !stop_requested && a->palette_report_entry >= 0;
+}
+
+static void terminal_prepare_palette(App *a, int automatic_color) {
+    /* Probe the reversible palette stack, rather than guessing from TERM.
+       Other terminals keep the ordinary RGB renderer. No colors change until
+       the terminal confirms that our saved palette is on its stack. */
+    if ((a->config.color != COLOR_TRUE && !automatic_color) || !terminal_palette_report(a) ||
+        a->palette_report_entry >= 10) return;
+    int previous = a->palette_report_entry;
+    if (!write_all("\033[#P", 4)) return;
+    terminal_palette_saved = 1;
+    if (terminal_palette_report(a) && a->palette_report_entry == previous+1) {
+        a->indexed_colors = 1;
+        a->config.color = COLOR_TRUE;
+    }
+}
+
 static const char *speed_name(int i) {
     static const char *names[4] = { "still slow", "drift", "flow", "current" };
     return names[i < 0 ? 0 : i > 3 ? 3 : i];
@@ -927,6 +1006,7 @@ static void app_footer(App *a, Output *o) {
 }
 
 static int colors_close(uint32_t before, uint32_t after, ColorMode mode) {
+    if ((before | after) & PALETTE_INDEXED) return before == after;
     if (mode != COLOR_TRUE) return before == after;
     for (int shift = 0; shift <= 16; shift += 8) {
         int delta = (int)((before >> shift)&255u) - (int)((after >> shift)&255u);
@@ -935,43 +1015,54 @@ static int colors_close(uint32_t before, uint32_t after, ColorMode mode) {
     return 1;
 }
 
+static unsigned int app_output_rate(const App *a) {
+    return a->indexed_colors ? OUTPUT_INDEXED_BYTES_PER_SECOND : OUTPUT_BYTES_PER_SECOND;
+}
+
 static void app_render(App *a) {
     Garden *g = &a->garden;
-    if (a->output.len) return;
+    if (a->output.len || seconds_now() < a->next_output_at) return;
     Output *o = &a->output;
     o->failed = 0;
+    a->output_palette = installed_palette;
     if (a->resized) {
-        output_str(o, "\033[0m\033[H\033[2J");
+        output_str(o, "\030\033[0m\033[H\033[2J");
         a->resized = 0;
         garden_invalidate(g);
         if (!g->w) output_str(o, "tidepool: enlarge the terminal to continue");
     }
-    if (!g->w) return;
+    if (!g->w) {
+        a->next_output_at = seconds_now() + (double)o->len / app_output_rate(a);
+        return;
+    }
     if (g->redraw) garden_invalidate(g);
+    if (a->indexed_colors && installed_palette != a->config.palette) {
+        output_palette(o, a->config.palette);
+        a->output_palette = a->config.palette;
+    }
     app_footer(a, o);
     g->redraw = 0;
     uint32_t current_fg = UINT32_MAX, current_bg = UINT32_MAX;
     double now = seconds_now();
     int last_written_row = -1, last_written_col = -1;
     const char *chars = " .,:-=+*#%@";
-    int pixels = g->cols * g->picture_rows;
-    /* Queue a small batch, with the newest brush area first. Remaining cells
-       are visited fairly across batches instead of waiting for a whole frame. */
-    for (int pass = 0; pass < 2; ++pass) {
-        int *cursor = pass == 0 ? &g->urgent_cursor : &g->render_cursor;
-        for (int scanned = 0; scanned < pixels && o->len + 128 <= OUTPUT_CAP; ++scanned) {
-            int index = *cursor;
-            *cursor = (index + 1) % pixels;
-            Cell *prev = &g->last[index];
-            if (pass == 0 && !prev->urgent) continue;
-            int x = index % g->cols, y = index / g->cols;
+    /* Capture one simulation state and send its changes together. Pacing is
+       between frames, rather than a visible scan across successive states. */
+    for (int y = 0; y < g->picture_rows; ++y) {
+        for (int x = 0; x < g->cols; ++x) {
+            Cell *prev = &g->last[y*g->cols+x];
             int top = (2*y)*g->w+x;
             int bottom = (2*y+1)*g->w+x;
             RGB t = palette_sample(a->config.palette, g->v[top], g->trace[top]);
             RGB b = palette_sample(a->config.palette, g->v[bottom], g->trace[bottom]);
             uint32_t fg = encode_color(t, a->config.color);
             uint32_t bg = encode_color(b, a->config.color);
+            if (a->indexed_colors) {
+                fg = PALETTE_INDEXED | (uint32_t)(16+palette_level(g->v[top], g->trace[top]));
+                bg = PALETTE_INDEXED | (uint32_t)(16+palette_level(g->v[bottom], g->trace[bottom]));
+            }
             uint32_t glyph = 0x2580; /* U+2580 upper-half block */
+            if (fg == bg) glyph = ' '; /* A solid cell needs only its background. */
             if (a->config.ascii || a->config.color == COLOR_MONO || !a->config.utf8) {
                 float concentration = (g->v[top]+g->v[bottom])*.5f;
                 float density = sqrtf(clampf(concentration/.43f, 0.f, 1.f));
@@ -991,14 +1082,15 @@ static void app_render(App *a) {
                     fg = encode_color(label, a->config.color);
                 }
             }
-            prev->urgent = 0;
             if (prev->glyph == glyph && colors_close(prev->fg, fg, a->config.color) &&
                 colors_close(prev->bg, bg, a->config.color))
                 continue;
             if (last_written_row != y || last_written_col != x-1) {
                 output_fmt(o, "\033[%d;%dH", y+1, x+1);
             }
-            if (fg != current_fg) { emit_color(o, fg, a->config.color, 0); current_fg = fg; }
+            if (glyph != ' ' && fg != current_fg) {
+                emit_color(o, fg, a->config.color, 0); current_fg = fg;
+            }
             if (bg != current_bg) { emit_color(o, bg, a->config.color, 1); current_bg = bg; }
             if (glyph == 0x2580) output_str(o, "▀");
             else if (glyph < 128) {
@@ -1012,6 +1104,7 @@ static void app_render(App *a) {
         }
     }
     if (o->failed) stop_requested = 1;
+    a->next_output_at = seconds_now() + (double)o->len / app_output_rate(a);
 }
 
 static void read_size(int *cols, int *rows) {
@@ -1135,7 +1228,8 @@ int main(int argc, char **argv) {
     const char *codeset = nl_langinfo(CODESET);
     a.config.utf8 = ci_contains(codeset,"UTF-8") || ci_contains(codeset,"UTF8");
     if (!a.config.utf8) a.config.ascii = 1;
-    if (a.config.color == COLOR_AUTO) a.config.color = detected_color();
+    int automatic_color = a.config.color == COLOR_AUTO;
+    if (automatic_color) a.config.color = detected_color();
     if (a.config.color == COLOR_MONO) a.config.ascii = 1;
     a.rng = a.config.seed_given ? a.config.seed :
         (unsigned int)time(NULL) ^ ((unsigned int)getpid()<<11) ^ 0x9e3779b9u;
@@ -1154,6 +1248,7 @@ int main(int argc, char **argv) {
     if (!garden_resize(&a, cols, rows)) {
         fputs("tidepool: terminal too large or allocation failed\n",stderr); return 2;
     }
+    terminal_prepare_palette(&a, automatic_color);
     double next_frame = seconds_now();
     const double interval = 1.0/a.config.fps;
     while (!stop_requested) {
@@ -1194,7 +1289,7 @@ int main(int argc, char **argv) {
         now = seconds_now();
         double wait_sec = next_frame-now;
         int output_pending = a.output.len != 0;
-        if (output_pending && a.next_output_at > now && a.next_output_at-now < wait_sec)
+        if (!output_pending && a.next_output_at > now && a.next_output_at-now < wait_sec)
             wait_sec = a.next_output_at-now;
         if (a.input_state == 1) {
             double esc_wait = .10-(now-a.esc_at);
@@ -1208,7 +1303,7 @@ int main(int argc, char **argv) {
         fd_set fds, output;
         FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
         FD_ZERO(&output);
-        int wait_output = output_pending && a.next_output_at <= now;
+        int wait_output = output_pending;
         if (wait_output) FD_SET(STDOUT_FILENO, &output);
         int ready = select(STDOUT_FILENO+1, &fds, wait_output ? &output : NULL, NULL, &tv);
         if (ready > 0) {

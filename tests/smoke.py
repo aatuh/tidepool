@@ -195,6 +195,58 @@ def run_output_budget_case():
         os.close(slave)
 
 
+def run_palette_stack_case(entry, count, *, confirm=True, color='truecolor'):
+    """Emulate the xterm handshake, including nested/full palette stacks."""
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 43, 149, 0, 0))
+    original = termios.tcgetattr(slave)
+    env = dict(os.environ, TERM='xterm', LC_ALL='C.UTF-8')
+    program = subprocess.Popen(
+        [EXECUTABLE, '--color', color, '--seed', '1', '--fps', '30'],
+        stdin=slave, stdout=slave, stderr=slave, env=env,
+        preexec_fn=take_terminal_control)
+    try:
+        wait_for_output(master, b'\x1b[#R')
+        # Reject an out-of-range reply without abandoning the capability probe.
+        os.write(master, b'\x1b[?99;99#Q')
+        os.write(master, f'\x1b[?{entry};{count}#Q'.encode())
+        pushed = entry < 10
+        if pushed:
+            data = wait_for_output(master, b'\x1b[#R')
+            assert b'\x1b[#P' in data, 'Palette was not saved before changing colors'
+            if confirm:
+                os.write(master, f'\x1b[?{entry+1};{max(count,entry+1)}#Q'.encode())
+        data = wait_for_output(master, b'tidepool / lagoon')
+        optimized = pushed and confirm
+        assert (b'\x1b]4;16;rgb:' in data) == optimized
+        if optimized:
+            # A paused repaint is bounded and contains indexed body colors.
+            os.write(master, b' ')
+            data = wait_for_output(master, b'paused')
+            if b'\x1b[48;5;' not in data:
+                data += wait_for_output(master, b'\x1b[48;5;')
+            os.write(master, b'\x1b[A')
+            data = wait_for_output(master, b'tidepool / orchid')
+            assert b'\x1b]4;16;rgb:14/12/21' in data, 'Theme colors did not change'
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 5, 20, 0, 0))
+            os.kill(program.pid, signal.SIGWINCH)
+            wait_for_output(master, b'enlarge the terminal')
+            fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 43, 149, 0, 0))
+            os.kill(program.pid, signal.SIGWINCH)
+            wait_for_output(master, b'tidepool / orchid')
+        os.write(master, b'\x03')
+        assert program.wait(timeout=1) == 0
+        data = wait_for_output(master, b'\x1b[?1049l')
+        assert (b'\x1b[#Q' in data) == pushed, 'Saved palette was not restored'
+        assert termios.tcgetattr(slave) == original
+    finally:
+        if program.poll() is None:
+            program.kill()
+            program.wait(timeout=4)
+        os.close(master)
+        os.close(slave)
+
+
 def run_case(options, *, mouse=True, utf8=True, resize=True, terminate=False):
     master, slave = pty.openpty()
     dimensions = struct.pack('HHHH', 28, 85, 0, 0)
@@ -284,6 +336,10 @@ def run_case(options, *, mouse=True, utf8=True, resize=True, terminate=False):
 
 
 def main():
+    for entry, count, confirm in [(0, 0, True), (3, 8, True), (10, 10, True), (0, 0, False)]:
+        run_palette_stack_case(entry, count, confirm=confirm)
+    run_palette_stack_case(0, 0, color='auto')
+    print('PTY palette: OK (save/restore, theme, resize, nested/full stack, unsupported fallback)')
     total = run_output_budget_case()
     print(f'PTY continuous rendering: OK ({total:,} bytes/s, responsive input)')
     run_paint_case()

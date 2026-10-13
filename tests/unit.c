@@ -113,16 +113,50 @@ static void verify_nonblocking_render(void) {
     double elapsed = seconds_now()-started;
     assert(dup2(original_stdout,STDOUT_FILENO) >= 0);
     close(original_stdout); close(sink);
-    assert(a.output.len > 0 && a.output.len <= OUTPUT_CAP && !a.output.failed);
+    assert(a.output.len > 0 && a.output.len <= a.output.capacity && !a.output.failed);
     int brush_cell = 40*a.garden.cols+145;
-    assert(a.garden.last[brush_cell].glyph == UINT32_MAX);
-    a.output.len = 0; /* The previous small batch has drained. */
+    assert(a.garden.last[brush_cell].glyph != UINT32_MAX); /* One coherent snapshot. */
+    uint32_t before_brush = a.garden.last[brush_cell].fg;
+    a.output.len = 0; /* The previous frame has drained. */
+    a.next_output_at = 0;
     garden_touch(&a.garden,145.f,80.f,.92f,0);
     app_render(&a);
     assert(a.garden.last[brush_cell].glyph != UINT32_MAX);
-    assert(!a.output.failed && a.output.len <= OUTPUT_CAP);
+    assert(a.garden.last[brush_cell].fg != before_brush);
+    assert(!a.output.failed && a.output.len <= a.output.capacity);
     garden_dispose(&a.garden);
     assert(elapsed < .05); /* Drawing must return control within one tick. */
+}
+
+static void verify_dense_paint_output(void) {
+    App a = {0};
+    a.config.hud = 1;
+    a.config.utf8 = 1;
+    a.config.color = COLOR_TRUE;
+    a.indexed_colors = 1;
+    a.rng = 743927;
+    make_keys(&a);
+    assert(garden_resize(&a,149,43));
+    app_render(&a);
+    for (int y = 3; y < 82; y += 8)
+        for (int x = 3; x < 146; x += 8)
+            garden_touch(&a.garden,(float)x,(float)y,.92f,0);
+    size_t bytes = 0;
+    for (int frame = 0; frame < 120; ++frame) {
+        garden_step(&a.garden); garden_step(&a.garden);
+        garden_trace_fade(&a.garden);
+        a.output.len = 0;
+        a.next_output_at = 0;
+        app_render(&a);
+        assert(!a.output.failed);
+        bytes += a.output.len;
+        installed_palette = a.output_palette;
+    }
+    /* A heavily painted screen must average at least 15 complete snapshots
+       per second within the terminal's output budget. */
+    assert(bytes/120 < OUTPUT_BYTES_PER_SECOND/15);
+    garden_dispose(&a.garden);
+    installed_palette = -1;
 }
 
 int main(void) {
@@ -196,6 +230,7 @@ int main(void) {
     verify_options();
     verify_exit_input();
     verify_nonblocking_render();
+    verify_dense_paint_output();
     float off_change = mature_change(RENEWAL_OFF);
     float gentle_change = mature_change(RENEWAL_GENTLE);
     float active_change = mature_change(RENEWAL_ACTIVE);
