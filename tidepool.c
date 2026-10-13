@@ -27,7 +27,7 @@
 
 #define PI 3.14159265358979323846
 #define MAX_KEYS 64
-#define OUTPUT_CAP 32768
+#define OUTPUT_CAP 8192
 #define OUTPUT_WRITE_CHUNK 4096
 #define OUTPUT_BYTES_PER_SECOND 256000
 #define MIN_COLS 24
@@ -68,13 +68,15 @@ typedef struct { uint32_t cp; float xn, yn; char utf8[5]; } Key;
 typedef struct {
     float x, y, direction, hunger;
 } Grazer;
-typedef struct { uint32_t fg, bg, glyph; } Cell;
+typedef struct { uint32_t fg, bg, glyph; int urgent; } Cell;
+typedef struct { char bytes[OUTPUT_CAP]; size_t len; int failed; } Output;
 typedef struct {
     int cols, rows, w, h, picture_rows;
     float *u, *v, *next_u, *next_v, *trace;
     Cell *last;
     uint32_t *key_overlay;
     int redraw;
+    int render_cursor, urgent_cursor;
 } Garden;
 
 typedef struct {
@@ -99,14 +101,10 @@ typedef struct {
     unsigned long ecology_steps;
     float garden_cover;
     char last_footer[384];
+    Output output;
+    size_t output_offset;
+    double next_output_at;
 } App;
-
-typedef struct {
-    char bytes[OUTPUT_CAP];
-    size_t len;
-    int failed;
-    App *app;
-} Output;
 
 static volatile sig_atomic_t stop_requested = 0;
 static volatile sig_atomic_t winch_requested = 0;
@@ -115,7 +113,6 @@ static int saved_tio_valid = 0;
 static int saved_output_flags = -1;
 static int terminal_active = 0;
 static int terminal_mouse = 0;
-static double next_output_at = 0.0;
 
 static void signal_stop(int signo) { (void)signo; stop_requested = 1; }
 static void signal_winch(int signo) { (void)signo; winch_requested = 1; }
@@ -136,45 +133,24 @@ static int install_signal_handlers(void) {
     return sigaction(SIGPIPE, &action, NULL) == 0;
 }
 
-static int write_all(const char *bytes, size_t len, App *a) {
-    /* A terminal emulator may pause reading during a resize. Wait for output
-       space without blocking input or signals; cleanup gets a bounded wait. */
-    double deadline = a ? 0.0 : seconds_now() + .10;
+static int write_all(const char *bytes, size_t len) {
+    /* Only terminal setup/cleanup use this bounded synchronous writer. */
+    double deadline = seconds_now() + .10;
     while (len) {
-        /* Mouse input changes the garden without cancelling the current frame.
-           Repeated full redraws would flood a slow terminal while painting. */
-        if (a) {
-            app_read_input(a);
-            if (stop_requested || winch_requested) return 0;
-            /* A writable PTY can accept data faster than xterm can draw it.
-               Pace the stream even when there is no kernel backpressure. */
-            double wait = next_output_at - seconds_now();
-            if (wait > 0.0) {
-                if (wait > .10) wait = .10;
-                fd_set input;
-                FD_ZERO(&input); FD_SET(STDIN_FILENO, &input);
-                struct timeval tv = {0, (suseconds_t)(wait * 1e6)};
-                int ready = select(STDIN_FILENO + 1, &input, NULL, NULL, &tv);
-                if (ready < 0 && errno != EINTR) { stop_requested = 1; return 0; }
-                continue;
-            }
-        } else if (seconds_now() >= deadline) return 0;
+        if (seconds_now() >= deadline) return 0;
         size_t chunk = len < OUTPUT_WRITE_CHUNK ? len : OUTPUT_WRITE_CHUNK;
         ssize_t n = write(STDOUT_FILENO, bytes, chunk);
         if (n > 0) {
             bytes += n; len -= (size_t)n;
-            if (a) next_output_at = seconds_now() + (double)n / OUTPUT_BYTES_PER_SECOND;
         }
         else if (n < 0 && errno == EINTR) continue;
         else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
-            fd_set input, output;
-            FD_ZERO(&input); FD_ZERO(&output);
-            FD_SET(STDIN_FILENO, &input); FD_SET(STDOUT_FILENO, &output);
-            double wait = a ? .10 : deadline - seconds_now();
+            fd_set output;
+            FD_ZERO(&output); FD_SET(STDOUT_FILENO, &output);
+            double wait = deadline - seconds_now();
             if (wait <= 0.0) return 0;
             struct timeval tv = {0, (suseconds_t)(wait * 1e6)};
-            int ready = select(STDOUT_FILENO + 1, a ? &input : NULL,
-                &output, NULL, &tv);
+            int ready = select(STDOUT_FILENO + 1, NULL, &output, NULL, &tv);
             if (ready < 0 && errno != EINTR) { stop_requested = 1; return 0; }
         } else { stop_requested = 1; return 0; }
     }
@@ -191,7 +167,7 @@ static void terminal_restore(void) {
         const char *cleanup = terminal_mouse ?
             "\033[?1006l\033[?1002l\033[?1000l\033[0m\033[?25h\033[?1049l" :
             "\033[0m\033[?25h\033[?1049l";
-        (void)write_all(cleanup, strlen(cleanup), NULL);
+        (void)write_all(cleanup, strlen(cleanup));
         terminal_active = 0;
     }
     if (saved_output_flags != -1)
@@ -223,11 +199,11 @@ static int terminal_start(int enable_mouse) {
        output writer both handle EAGAIN if this also makes stdin nonblocking. */
     terminal_active = 1;
     (void)write_all("\033[?1049h\033[?25l\033[2J\033[H",
-        strlen("\033[?1049h\033[?25l\033[2J\033[H"), NULL);
+        strlen("\033[?1049h\033[?25l\033[2J\033[H"));
     if (enable_mouse) {
         terminal_mouse = 1;
         (void)write_all("\033[?1000h\033[?1002h\033[?1006h",
-            strlen("\033[?1000h\033[?1002h\033[?1006h"), NULL);
+            strlen("\033[?1000h\033[?1002h\033[?1006h"));
     }
     return 1;
 }
@@ -262,20 +238,11 @@ static float random_unit(App *a) {
     return (float)(random_u32(a) >> 8) * (1.f / 16777216.f);
 }
 
-static int output_flush(Output *o) {
-    if (o->len && !o->failed && !write_all(o->bytes, o->len, o->app)) o->failed = 1;
-    o->len = 0;
-    if (stop_requested) o->failed = 1;
-    return !o->failed;
-}
 static void output_bytes(Output *o, const char *bytes, size_t n) {
-    while (n && !o->failed) {
-        size_t space = OUTPUT_CAP - o->len;
-        size_t take = n < space ? n : space;
-        if (!space) { (void)output_flush(o); continue; }
-        memcpy(o->bytes + o->len, bytes, take);
-        o->len += take; bytes += take; n -= take;
-    }
+    if (o->failed) return;
+    if (n > OUTPUT_CAP - o->len) { o->failed = 1; return; }
+    memcpy(o->bytes + o->len, bytes, n);
+    o->len += n;
 }
 static void output_str(Output *o, const char *s) { output_bytes(o, s, strlen(s)); }
 static void output_fmt(Output *o, const char *fmt, ...) {
@@ -285,6 +252,23 @@ static void output_fmt(Output *o, const char *fmt, ...) {
     int n = vsnprintf(tmp, sizeof(tmp), fmt, ap);
     va_end(ap);
     if (n > 0) output_bytes(o, tmp, (size_t)n < sizeof(tmp) ? (size_t)n : sizeof(tmp)-1);
+}
+
+static void app_flush_output(App *a) {
+    if (!a->output.len || seconds_now() < a->next_output_at) return;
+    size_t left = a->output.len - a->output_offset;
+    size_t chunk = left < OUTPUT_WRITE_CHUNK ? left : OUTPUT_WRITE_CHUNK;
+    ssize_t n = write(STDOUT_FILENO, a->output.bytes + a->output_offset, chunk);
+    if (n > 0) {
+        a->output_offset += (size_t)n;
+        a->next_output_at = seconds_now() + (double)n / OUTPUT_BYTES_PER_SECOND;
+        if (a->output_offset == a->output.len) {
+            a->output.len = 0;
+            a->output_offset = 0;
+        }
+    } else if (n == 0 || (errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK)) {
+        stop_requested = 1;
+    }
 }
 
 /* Terminal output uses a 24-bit, 256-color, 16-color, or monochrome fallback. */
@@ -555,6 +539,8 @@ static void garden_touch(Garden *g, float px, float py, float force, int quiet) 
     const float r = clampf(fminf(g->w, g->h)*.080f, 3.2f, 7.0f);
     const int reach = (int)ceilf(2.2f*r);
     int cx = (int)lroundf(px), cy = (int)lroundf(py);
+    g->urgent_cursor = ((cy-reach+g->h*3)%g->h/2)*g->cols +
+        (cx-reach+g->w*3)%g->w;
     for (int dy = -reach; dy <= reach; ++dy) {
         int y = (cy+dy+g->h*3) % g->h;
         for (int dx = -reach; dx <= reach; ++dx) {
@@ -571,6 +557,7 @@ static void garden_touch(Garden *g, float px, float py, float force, int quiet) 
                 g->u[i] *= 1.f-.38f*z;
             }
             g->trace[i] = fmaxf(g->trace[i], .30f*z);
+            g->last[(y/2)*g->cols+x].urgent = 1;
         }
     }
 }
@@ -660,8 +647,7 @@ static int garden_resize(App *a, int cols, int rows) {
     if (cols < MIN_COLS || rows < MIN_ROWS) {
         garden_dispose(g);
         a->grazer_count = 0;
-        const char *small = "\033[0m\033[H\033[2Jtidepool: enlarge the terminal to continue";
-        (void)write_all(small, strlen(small), a);
+        a->output.len = a->output_offset = 0;
         a->resized = 1;
         return 1;
     }
@@ -687,6 +673,7 @@ static int garden_resize(App *a, int cols, int rows) {
         newg.last[i].fg = UINT32_MAX;
         newg.last[i].bg = UINT32_MAX;
         newg.last[i].glyph = UINT32_MAX;
+        newg.last[i].urgent = 0;
     }
     newg.redraw = 1;
     if (g->w) {
@@ -723,6 +710,7 @@ static int garden_resize(App *a, int cols, int rows) {
     }
     garden_dispose(g);
     *g = newg;
+    a->output.len = a->output_offset = 0;
     garden_make_overlay(a);
     a->last_footer[0] = 0;
     a->resized = 1;
@@ -938,21 +926,45 @@ static void app_footer(App *a, Output *o) {
     output_str(o, line);
 }
 
+static int colors_close(uint32_t before, uint32_t after, ColorMode mode) {
+    if (mode != COLOR_TRUE) return before == after;
+    for (int shift = 0; shift <= 16; shift += 8) {
+        int delta = (int)((before >> shift)&255u) - (int)((after >> shift)&255u);
+        if (delta < -3 || delta > 3) return 0;
+    }
+    return 1;
+}
+
 static void app_render(App *a) {
     Garden *g = &a->garden;
-    if (!g->w) return;
-    Output o = {{0},0,0,a};
+    if (a->output.len) return;
+    Output *o = &a->output;
+    o->failed = 0;
     if (a->resized) {
-        output_str(&o, "\033[0m\033[H\033[2J");
+        output_str(o, "\033[0m\033[H\033[2J");
         a->resized = 0;
         garden_invalidate(g);
+        if (!g->w) output_str(o, "tidepool: enlarge the terminal to continue");
     }
+    if (!g->w) return;
+    if (g->redraw) garden_invalidate(g);
+    app_footer(a, o);
+    g->redraw = 0;
     uint32_t current_fg = UINT32_MAX, current_bg = UINT32_MAX;
     double now = seconds_now();
     int last_written_row = -1, last_written_col = -1;
     const char *chars = " .,:-=+*#%@";
-    for (int y = 0; y < g->picture_rows && !o.failed; ++y) {
-        for (int x = 0; x < g->cols && !o.failed; ++x) {
+    int pixels = g->cols * g->picture_rows;
+    /* Queue a small batch, with the newest brush area first. Remaining cells
+       are visited fairly across batches instead of waiting for a whole frame. */
+    for (int pass = 0; pass < 2; ++pass) {
+        int *cursor = pass == 0 ? &g->urgent_cursor : &g->render_cursor;
+        for (int scanned = 0; scanned < pixels && o->len + 128 <= OUTPUT_CAP; ++scanned) {
+            int index = *cursor;
+            *cursor = (index + 1) % pixels;
+            Cell *prev = &g->last[index];
+            if (pass == 0 && !prev->urgent) continue;
+            int x = index % g->cols, y = index / g->cols;
             int top = (2*y)*g->w+x;
             int bottom = (2*y+1)*g->w+x;
             RGB t = palette_sample(a->config.palette, g->v[top], g->trace[top]);
@@ -979,34 +991,27 @@ static void app_render(App *a) {
                     fg = encode_color(label, a->config.color);
                 }
             }
-            Cell *prev = &g->last[y*g->cols+x];
-            if (!g->redraw && prev->fg == fg && prev->bg == bg && prev->glyph == glyph)
+            prev->urgent = 0;
+            if (prev->glyph == glyph && colors_close(prev->fg, fg, a->config.color) &&
+                colors_close(prev->bg, bg, a->config.color))
                 continue;
             if (last_written_row != y || last_written_col != x-1) {
-                output_fmt(&o, "\033[%d;%dH", y+1, x+1);
+                output_fmt(o, "\033[%d;%dH", y+1, x+1);
             }
-            if (fg != current_fg) { emit_color(&o, fg, a->config.color, 0); current_fg = fg; }
-            if (bg != current_bg) { emit_color(&o, bg, a->config.color, 1); current_bg = bg; }
-            if (glyph == 0x2580) output_str(&o, "▀");
+            if (fg != current_fg) { emit_color(o, fg, a->config.color, 0); current_fg = fg; }
+            if (bg != current_bg) { emit_color(o, bg, a->config.color, 1); current_bg = bg; }
+            if (glyph == 0x2580) output_str(o, "▀");
             else if (glyph < 128) {
                 char c = (char)glyph;
-                output_bytes(&o, &c, 1);
+                output_bytes(o, &c, 1);
             } else {
-                char encoded[5]; encode_utf8(glyph, encoded); output_str(&o, encoded);
+                char encoded[5]; encode_utf8(glyph, encoded); output_str(o, encoded);
             }
             prev->fg = fg; prev->bg = bg; prev->glyph = glyph;
             last_written_row = y; last_written_col = x;
         }
     }
-    app_footer(a, &o);
-    g->redraw = 0;
-    if (!output_flush(&o)) {
-        /* A cancelled frame may be only partly visible. Repaint it completely
-           after processing the pending input or new terminal dimensions. */
-        a->resized = 1;
-        a->last_footer[0] = 0;
-        garden_invalidate(g);
-    }
+    if (o->failed) stop_requested = 1;
 }
 
 static void read_size(int *cols, int *rows) {
@@ -1044,7 +1049,7 @@ static void print_help(FILE *out) {
         "  --color MODE        auto (default), truecolor, 256, 16, mono\n"
         "  --ascii             Use ASCII shades instead of Unicode half-blocks\n"
         "  --mono              ASCII without color\n"
-        "  --fps N             Frame rate 5–30 (default: 14)\n"
+        "  --fps N             Simulation rate 5–30 (default: 14)\n"
         "  --renewal MODE      off (default), gentle, active: local grazing\n"
         "  --seed N            Repeat a garden's initial random seed\n"
         "  --no-mouse          Don't enable terminal mouse reporting\n"
@@ -1180,14 +1185,17 @@ int main(int argc, char **argv) {
                     }
                     garden_trace_fade(&a.garden);
                 }
-                /* Keep the bare-Esc timeout running even if output is stalled. */
-                if (a.input_state != 1) app_render(&a);
             }
             if (now-next_frame > interval*1.5) next_frame = now + interval;
             else next_frame += interval;
         }
+        if (a.input_state != 1) app_render(&a);
+        app_flush_output(&a);
         now = seconds_now();
         double wait_sec = next_frame-now;
+        int output_pending = a.output.len != 0;
+        if (output_pending && a.next_output_at > now && a.next_output_at-now < wait_sec)
+            wait_sec = a.next_output_at-now;
         if (a.input_state == 1) {
             double esc_wait = .10-(now-a.esc_at);
             if (esc_wait < wait_sec) wait_sec = esc_wait;
@@ -1197,11 +1205,14 @@ int main(int argc, char **argv) {
         struct timeval tv;
         tv.tv_sec = (long)wait_sec;
         tv.tv_usec = (suseconds_t)((wait_sec-tv.tv_sec)*1e6);
-        fd_set fds;
+        fd_set fds, output;
         FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
-        int ready = select(STDIN_FILENO+1, &fds, NULL, NULL, &tv);
+        FD_ZERO(&output);
+        int wait_output = output_pending && a.next_output_at <= now;
+        if (wait_output) FD_SET(STDOUT_FILENO, &output);
+        int ready = select(STDOUT_FILENO+1, &fds, wait_output ? &output : NULL, NULL, &tv);
         if (ready > 0) {
-            app_read_input(&a);
+            if (FD_ISSET(STDIN_FILENO, &fds)) app_read_input(&a);
         } else if (ready < 0 && errno != EINTR) {
             stop_requested = 1;
         }

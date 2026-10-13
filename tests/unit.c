@@ -96,6 +96,35 @@ static void verify_exit_input(void) {
     stop_requested = 0;
 }
 
+static void verify_nonblocking_render(void) {
+    App a = {0};
+    a.config.hud = 1;
+    a.config.utf8 = 1;
+    a.config.color = COLOR_TRUE;
+    a.rng = 743927;
+    make_keys(&a);
+    assert(garden_resize(&a,149,43));
+    int original_stdout = dup(STDOUT_FILENO);
+    int sink = open("/dev/null", O_WRONLY);
+    assert(original_stdout >= 0 && sink >= 0);
+    assert(dup2(sink,STDOUT_FILENO) >= 0);
+    double started = seconds_now();
+    app_render(&a);
+    double elapsed = seconds_now()-started;
+    assert(dup2(original_stdout,STDOUT_FILENO) >= 0);
+    close(original_stdout); close(sink);
+    assert(a.output.len > 0 && a.output.len <= OUTPUT_CAP && !a.output.failed);
+    int brush_cell = 40*a.garden.cols+145;
+    assert(a.garden.last[brush_cell].glyph == UINT32_MAX);
+    a.output.len = 0; /* The previous small batch has drained. */
+    garden_touch(&a.garden,145.f,80.f,.92f,0);
+    app_render(&a);
+    assert(a.garden.last[brush_cell].glyph != UINT32_MAX);
+    assert(!a.output.failed && a.output.len <= OUTPUT_CAP);
+    garden_dispose(&a.garden);
+    assert(elapsed < .05); /* Drawing must return control within one tick. */
+}
+
 int main(void) {
     App a={0};
     a.config.hud=1;
@@ -166,6 +195,7 @@ int main(void) {
     garden_dispose(&a.garden);
     verify_options();
     verify_exit_input();
+    verify_nonblocking_render();
     float off_change = mature_change(RENEWAL_OFF);
     float gentle_change = mature_change(RENEWAL_GENTLE);
     float active_change = mature_change(RENEWAL_ACTIVE);
