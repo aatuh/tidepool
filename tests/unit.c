@@ -82,6 +82,20 @@ static void verify_options(void) {
     assert(parse_args(3,active,&c)==1 && c.renewal==RENEWAL_ACTIVE);
 }
 
+static void verify_exit_input(void) {
+    for (int state = 0; state <= 3; ++state) {
+        for (int byte = 3; byte <= 4; ++byte) {
+            App a = {0};
+            a.input_state = state;
+            a.utf_expected = 2;
+            stop_requested = 0;
+            app_input_byte(&a, (unsigned char)byte);
+            assert(stop_requested);
+        }
+    }
+    stop_requested = 0;
+}
+
 int main(void) {
     App a={0};
     a.config.hud=1;
@@ -151,6 +165,7 @@ int main(void) {
     free(oldv);
     garden_dispose(&a.garden);
     verify_options();
+    verify_exit_input();
     float off_change = mature_change(RENEWAL_OFF);
     float gentle_change = mature_change(RENEWAL_GENTLE);
     float active_change = mature_change(RENEWAL_ACTIVE);

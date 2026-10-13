@@ -28,6 +28,7 @@
 #define PI 3.14159265358979323846
 #define MAX_KEYS 64
 #define OUTPUT_CAP 32768
+#define OUTPUT_WRITE_CHUNK 4096
 #define MIN_COLS 24
 #define MIN_ROWS 8
 #define MAX_GRAZERS 10
@@ -75,8 +76,6 @@ typedef struct {
     int redraw;
 } Garden;
 
-typedef struct { char bytes[OUTPUT_CAP]; size_t len; int failed; } Output;
-
 typedef struct {
     Config config;
     Garden garden;
@@ -101,6 +100,13 @@ typedef struct {
     char last_footer[384];
 } App;
 
+typedef struct {
+    char bytes[OUTPUT_CAP];
+    size_t len;
+    int failed;
+    App *app;
+} Output;
+
 static volatile sig_atomic_t stop_requested = 0;
 static volatile sig_atomic_t winch_requested = 0;
 static struct termios saved_tio;
@@ -113,6 +119,7 @@ static void signal_stop(int signo) { (void)signo; stop_requested = 1; }
 static void signal_winch(int signo) { (void)signo; winch_requested = 1; }
 
 static double seconds_now(void);
+static void app_read_input(App *a);
 
 static int install_signal_handlers(void) {
     struct sigaction action = {0};
@@ -127,26 +134,30 @@ static int install_signal_handlers(void) {
     return sigaction(SIGPIPE, &action, NULL) == 0;
 }
 
-static int write_all(const char *bytes, size_t len, int interruptible) {
+static int write_all(const char *bytes, size_t len, App *a) {
     /* A terminal emulator may pause reading during a resize. Wait for output
        space without blocking input or signals; cleanup gets a bounded wait. */
-    double deadline = interruptible ? 0.0 : seconds_now() + .10;
+    double deadline = a ? 0.0 : seconds_now() + .10;
     while (len) {
-        if (interruptible && (stop_requested || winch_requested)) return 0;
-        if (!interruptible && seconds_now() >= deadline) return 0;
-        ssize_t n = write(STDOUT_FILENO, bytes, len);
+        /* Mouse input changes the garden without cancelling the current frame.
+           Repeated full redraws would flood a slow terminal while painting. */
+        if (a) {
+            app_read_input(a);
+            if (stop_requested || winch_requested) return 0;
+        } else if (seconds_now() >= deadline) return 0;
+        size_t chunk = len < OUTPUT_WRITE_CHUNK ? len : OUTPUT_WRITE_CHUNK;
+        ssize_t n = write(STDOUT_FILENO, bytes, chunk);
         if (n > 0) { bytes += n; len -= (size_t)n; }
         else if (n < 0 && errno == EINTR) continue;
         else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             fd_set input, output;
             FD_ZERO(&input); FD_ZERO(&output);
             FD_SET(STDIN_FILENO, &input); FD_SET(STDOUT_FILENO, &output);
-            double wait = interruptible ? .10 : deadline - seconds_now();
+            double wait = a ? .10 : deadline - seconds_now();
             if (wait <= 0.0) return 0;
             struct timeval tv = {0, (suseconds_t)(wait * 1e6)};
-            int ready = select(STDOUT_FILENO + 1, interruptible ? &input : NULL,
+            int ready = select(STDOUT_FILENO + 1, a ? &input : NULL,
                 &output, NULL, &tv);
-            if (ready > 0 && interruptible && FD_ISSET(STDIN_FILENO, &input)) return 0;
             if (ready < 0 && errno != EINTR) { stop_requested = 1; return 0; }
         } else { stop_requested = 1; return 0; }
     }
@@ -163,7 +174,7 @@ static void terminal_restore(void) {
         const char *cleanup = terminal_mouse ?
             "\033[?1006l\033[?1002l\033[?1000l\033[0m\033[?25h\033[?1049l" :
             "\033[0m\033[?25h\033[?1049l";
-        (void)write_all(cleanup, strlen(cleanup), 0);
+        (void)write_all(cleanup, strlen(cleanup), NULL);
         terminal_active = 0;
     }
     if (saved_output_flags != -1)
@@ -181,7 +192,13 @@ static int terminal_start(int enable_mouse) {
     raw.c_iflag &= (tcflag_t)~(BRKINT | ICRNL | INPCK | ISTRIP | IXON);
     raw.c_oflag &= (tcflag_t)~OPOST;
     raw.c_cflag |= CS8;
-    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | IEXTEN | ISIG);
+    raw.c_lflag &= (tcflag_t)~(ECHO | ICANON | IEXTEN);
+    /* Ctrl-C must interrupt computation as well as reads, independently of
+       any unfinished mouse/escape sequence in the input parser. */
+    raw.c_lflag |= ISIG;
+    raw.c_cc[VINTR] = 3;
+    raw.c_cc[VQUIT] = _POSIX_VDISABLE;
+    raw.c_cc[VSUSP] = _POSIX_VDISABLE;
     raw.c_cc[VMIN] = 0;
     raw.c_cc[VTIME] = 0;
     if (tcsetattr(STDIN_FILENO, TCSAFLUSH, &raw) != 0) return 0;
@@ -189,11 +206,11 @@ static int terminal_start(int enable_mouse) {
        output writer both handle EAGAIN if this also makes stdin nonblocking. */
     terminal_active = 1;
     (void)write_all("\033[?1049h\033[?25l\033[2J\033[H",
-        strlen("\033[?1049h\033[?25l\033[2J\033[H"), 0);
+        strlen("\033[?1049h\033[?25l\033[2J\033[H"), NULL);
     if (enable_mouse) {
         terminal_mouse = 1;
         (void)write_all("\033[?1000h\033[?1002h\033[?1006h",
-            strlen("\033[?1000h\033[?1002h\033[?1006h"), 0);
+            strlen("\033[?1000h\033[?1002h\033[?1006h"), NULL);
     }
     return 1;
 }
@@ -229,7 +246,7 @@ static float random_unit(App *a) {
 }
 
 static int output_flush(Output *o) {
-    if (o->len && !o->failed && !write_all(o->bytes, o->len, 1)) o->failed = 1;
+    if (o->len && !o->failed && !write_all(o->bytes, o->len, o->app)) o->failed = 1;
     o->len = 0;
     if (stop_requested) o->failed = 1;
     return !o->failed;
@@ -627,7 +644,7 @@ static int garden_resize(App *a, int cols, int rows) {
         garden_dispose(g);
         a->grazer_count = 0;
         const char *small = "\033[0m\033[H\033[2Jtidepool: enlarge the terminal to continue";
-        (void)write_all(small, strlen(small), 1);
+        (void)write_all(small, strlen(small), a);
         a->resized = 1;
         return 1;
     }
@@ -793,6 +810,7 @@ static void app_character(App *a, uint32_t cp) {
 }
 
 static void app_input_byte(App *a, unsigned char byte) {
+    if (byte == 3 || byte == 4) { stop_requested = 1; return; }
     if (a->input_state == 1) {
         if (byte == '[') { a->input_state = 2; a->escape_length = 0; return; }
         if (byte == 'O') { a->input_state = 3; a->escape_length = 0; return; }
@@ -847,6 +865,19 @@ static void app_input_byte(App *a, unsigned char byte) {
     }
 }
 
+static void app_read_input(App *a) {
+    /* One bounded batch keeps a continuous stream of mouse reports from
+       starving rendering, resize handling, and shutdown. VMIN/VTIME are zero. */
+    unsigned char buf[512];
+    ssize_t n = read(STDIN_FILENO, buf, sizeof(buf));
+    if (n < 0 && errno != EINTR && errno != EAGAIN && errno != EWOULDBLOCK) {
+        stop_requested = 1;
+        return;
+    }
+    for (ssize_t i = 0; i < n && !stop_requested; ++i) app_input_byte(a, buf[i]);
+    if (a->input_state == 1 && seconds_now() - a->esc_at > .10) stop_requested = 1;
+}
+
 static const char *speed_name(int i) {
     static const char *names[4] = { "still slow", "drift", "flow", "current" };
     return names[i < 0 ? 0 : i > 3 ? 3 : i];
@@ -893,7 +924,7 @@ static void app_footer(App *a, Output *o) {
 static void app_render(App *a) {
     Garden *g = &a->garden;
     if (!g->w) return;
-    Output o = {{0},0,0};
+    Output o = {{0},0,0,a};
     if (a->resized) {
         output_str(&o, "\033[0m\033[H\033[2J");
         a->resized = 0;
@@ -1104,6 +1135,8 @@ int main(int argc, char **argv) {
     double next_frame = seconds_now();
     const double interval = 1.0/a.config.fps;
     while (!stop_requested) {
+        app_read_input(&a);
+        if (stop_requested) break;
         if (winch_requested) {
             winch_requested = 0;
             read_size(&cols,&rows);
@@ -1151,11 +1184,7 @@ int main(int argc, char **argv) {
         FD_ZERO(&fds); FD_SET(STDIN_FILENO, &fds);
         int ready = select(STDIN_FILENO+1, &fds, NULL, NULL, &tv);
         if (ready > 0) {
-            unsigned char buf[512];
-            ssize_t n;
-            while ((n = read(STDIN_FILENO, buf, sizeof(buf))) > 0) {
-                for (ssize_t i = 0; i < n && !stop_requested; ++i) app_input_byte(&a,buf[i]);
-            }
+            app_read_input(&a);
         } else if (ready < 0 && errno != EINTR) {
             stop_requested = 1;
         }

@@ -16,6 +16,12 @@ import time
 EXECUTABLE = os.path.abspath(sys.argv[1] if len(sys.argv) > 1 else './builds/tidepool')
 
 
+def take_terminal_control():
+    os.setsid()
+    fcntl.ioctl(0, termios.TIOCSCTTY, 0)
+    os.tcsetpgrp(0, os.getpgrp())
+
+
 def wait_for_output(master, expected, timeout=3):
     data = bytearray()
     deadline = time.monotonic() + timeout
@@ -39,7 +45,8 @@ def run_resize_case(exit_method, *, stalled=False, shared_stdio=True):
     env = dict(os.environ, TERM='xterm-256color', LC_ALL='C.UTF-8')
     program = subprocess.Popen(
         [EXECUTABLE, '--color', 'truecolor', '--seed', '1'],
-        stdin=slave, stdout=output_slave, stderr=output_slave, env=env, start_new_session=True)
+        stdin=slave, stdout=output_slave, stderr=output_slave, env=env,
+        preexec_fn=take_terminal_control)
     try:
         wait_for_output(master, b'tidepool / lagoon')
         os.write(master, b' ')
@@ -94,6 +101,64 @@ def run_resize_case(exit_method, *, stalled=False, shared_stdio=True):
         os.close(slave)
 
 
+def run_paint_case(*, stalled=False, partial_input=False):
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 43, 149, 0, 0))
+    original = termios.tcgetattr(slave)
+    original_flags = fcntl.fcntl(slave, fcntl.F_GETFL)
+    env = dict(os.environ, TERM='xterm-256color', LC_ALL='C.UTF-8')
+    program = subprocess.Popen(
+        [EXECUTABLE, '--color', 'truecolor', '--seed', '1', '--fps', '30'],
+        stdin=slave, stdout=slave, stderr=slave, env=env,
+        preexec_fn=take_terminal_control)
+    data = bytearray()
+    finished = threading.Event()
+    reader = None
+
+    def collect_slowly():
+        while not finished.is_set():
+            if select.select([master], [], [], .01)[0]:
+                chunk = os.read(master, 4096)
+                data.extend(chunk)
+                finished.wait(len(chunk) / 256000)
+
+    try:
+        wait_for_output(master, b'tidepool / lagoon')
+        os.write(master, b' ')
+        wait_for_output(master, b'paused')
+        if not stalled:
+            reader = threading.Thread(target=collect_slowly, daemon=True)
+            reader.start()
+        for _ in range(3):
+            os.write(master, b'\x1b[<0;30;20M')
+            for x in range(30, 140, 3):
+                os.write(master, f'\x1b[<32;{x};20M'.encode())
+                time.sleep(.008)
+            os.write(master, b'\x1b[<0;140;20m')
+        if partial_input:
+            os.write(master, b'\x1b[<32;40;')
+        os.write(master, b'\x03')
+        assert program.wait(timeout=1) == 0, 'Ctrl-C did not promptly exit while painting'
+        assert termios.tcgetattr(slave) == original, 'Terminal settings not restored after painting'
+        assert fcntl.fcntl(slave, fcntl.F_GETFL) == original_flags, 'File flags not restored after painting'
+        finished.set()
+        if reader:
+            reader.join(timeout=1)
+        if b'\x1b[?1049l' not in data:
+            data.extend(wait_for_output(master, b'\x1b[?1049l'))
+        assert b'\x1b[?25h' in data and b'\x1b[?1006l' in data
+        assert b'\x1b[H\x1b[2J' not in data, 'Painting restarted a full-screen redraw'
+    finally:
+        finished.set()
+        if reader:
+            reader.join(timeout=1)
+        if program.poll() is None:
+            program.kill()
+            program.wait(timeout=4)
+        os.close(master)
+        os.close(slave)
+
+
 def run_case(options, *, mouse=True, utf8=True, resize=True, terminate=False):
     master, slave = pty.openpty()
     dimensions = struct.pack('HHHH', 28, 85, 0, 0)
@@ -103,7 +168,8 @@ def run_case(options, *, mouse=True, utf8=True, resize=True, terminate=False):
     env.update({'TERM': 'xterm-256color', 'COLORTERM': 'truecolor',
                 'LANG': 'C.UTF-8', 'LC_ALL': 'C.UTF-8'})
     program = subprocess.Popen([EXECUTABLE, *options], stdin=slave,
-                               stdout=slave, stderr=slave, env=env, start_new_session=True)
+                               stdout=slave, stderr=slave, env=env,
+                               preexec_fn=take_terminal_control)
     buf = bytearray()
     finished = threading.Event()
     def collect():
@@ -182,6 +248,10 @@ def run_case(options, *, mouse=True, utf8=True, resize=True, terminate=False):
 
 
 def main():
+    run_paint_case()
+    print('PTY painting: OK (slow output, no full-screen clears, prompt Ctrl-C)')
+    run_paint_case(stalled=True, partial_input=True)
+    print('PTY painting: OK (stalled output, incomplete mouse report, prompt Ctrl-C)')
     run_resize_case('ctrl-c')
     print('PTY resize: OK (repeated resizes, tiny terminal recovery, Ctrl-C)')
     for exit_method in ['ctrl-c', 'escape', 'sigterm', 'interaction', 'resize']:
