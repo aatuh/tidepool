@@ -104,7 +104,7 @@ Mouse support requires an xterm-compatible emulator supporting SGR mouse reports
 - Two grids, `U` and `V`, follow Gray–Scott equations, updated using a nine-point discrete Laplacian and wrapping boundaries. In the default model, `Dᵤ = 0.16`, `Dᵥ = 0.08`, feed = `0.035`, kill = `0.060`. Grazing is an **optional, additional model rule**, not part of the classic Gray–Scott equations.
 - A click or keystroke makes a small, softly tapered adjustment to local chemical concentrations, then the simulation takes over. A faint trace fades on its own.
 - Colors are sampled from a smooth palette, with a dark foundation and warmer/lighter concentrations. Truecolor, 256-color, 16-color, and no-color rendering are supported.
-- To save terminal bandwidth, only changed text cells are repainted. The rendering frequency can be reduced to conserve CPU; try `--fps 8`.
+- Only changed text cells are repainted, and terminal output is limited to 256 kB/s to keep the terminal responsive. Large windows may render below the requested `--fps` rate. To conserve more CPU, try `--fps 8`.
 - Window resizing resamples the current garden rather than restarting it.
 - Pausing really pauses: there's no animated spinner or breathing cue demanding attention.
 

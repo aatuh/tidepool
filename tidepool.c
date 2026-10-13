@@ -29,6 +29,7 @@
 #define MAX_KEYS 64
 #define OUTPUT_CAP 32768
 #define OUTPUT_WRITE_CHUNK 4096
+#define OUTPUT_BYTES_PER_SECOND 256000
 #define MIN_COLS 24
 #define MIN_ROWS 8
 #define MAX_GRAZERS 10
@@ -114,6 +115,7 @@ static int saved_tio_valid = 0;
 static int saved_output_flags = -1;
 static int terminal_active = 0;
 static int terminal_mouse = 0;
+static double next_output_at = 0.0;
 
 static void signal_stop(int signo) { (void)signo; stop_requested = 1; }
 static void signal_winch(int signo) { (void)signo; winch_requested = 1; }
@@ -144,10 +146,25 @@ static int write_all(const char *bytes, size_t len, App *a) {
         if (a) {
             app_read_input(a);
             if (stop_requested || winch_requested) return 0;
+            /* A writable PTY can accept data faster than xterm can draw it.
+               Pace the stream even when there is no kernel backpressure. */
+            double wait = next_output_at - seconds_now();
+            if (wait > 0.0) {
+                if (wait > .10) wait = .10;
+                fd_set input;
+                FD_ZERO(&input); FD_SET(STDIN_FILENO, &input);
+                struct timeval tv = {0, (suseconds_t)(wait * 1e6)};
+                int ready = select(STDIN_FILENO + 1, &input, NULL, NULL, &tv);
+                if (ready < 0 && errno != EINTR) { stop_requested = 1; return 0; }
+                continue;
+            }
         } else if (seconds_now() >= deadline) return 0;
         size_t chunk = len < OUTPUT_WRITE_CHUNK ? len : OUTPUT_WRITE_CHUNK;
         ssize_t n = write(STDOUT_FILENO, bytes, chunk);
-        if (n > 0) { bytes += n; len -= (size_t)n; }
+        if (n > 0) {
+            bytes += n; len -= (size_t)n;
+            if (a) next_output_at = seconds_now() + (double)n / OUTPUT_BYTES_PER_SECOND;
+        }
         else if (n < 0 && errno == EINTR) continue;
         else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
             fd_set input, output;

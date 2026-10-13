@@ -159,6 +159,42 @@ def run_paint_case(*, stalled=False, partial_input=False):
         os.close(slave)
 
 
+def run_output_budget_case():
+    master, slave = pty.openpty()
+    fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 61, 155, 0, 0))
+    original = termios.tcgetattr(slave)
+    env = dict(os.environ, TERM='xterm', LC_ALL='C.UTF-8')
+    program = subprocess.Popen(
+        [EXECUTABLE, '--color', 'truecolor', '--fps', '30', '--seed', '1'],
+        stdin=slave, stdout=slave, stderr=slave, env=env,
+        preexec_fn=take_terminal_control)
+    try:
+        wait_for_output(master, b'tidepool / lagoon')
+        data = bytearray()
+        started = time.monotonic()
+        deadline = started + 1
+        while time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if remaining > 0 and select.select([master], [], [], remaining)[0]:
+                data.extend(os.read(master, 32768))
+        assert data, 'Running garden stopped producing updates'
+        # Leave room for one read spanning the end of the measurement window.
+        assert len(data) <= 256000 + 32768, f'Continuous rendering flooded the terminal: {len(data):,} bytes/s'
+        os.write(master, b' \x1b[A')
+        wait_for_output(master, b'paused')
+        os.write(master, b'\x03')
+        assert program.wait(timeout=1) == 0
+        assert termios.tcgetattr(slave) == original
+        wait_for_output(master, b'\x1b[?1049l')
+        return len(data)
+    finally:
+        if program.poll() is None:
+            program.kill()
+            program.wait(timeout=4)
+        os.close(master)
+        os.close(slave)
+
+
 def run_case(options, *, mouse=True, utf8=True, resize=True, terminate=False):
     master, slave = pty.openpty()
     dimensions = struct.pack('HHHH', 28, 85, 0, 0)
@@ -248,6 +284,8 @@ def run_case(options, *, mouse=True, utf8=True, resize=True, terminate=False):
 
 
 def main():
+    total = run_output_budget_case()
+    print(f'PTY continuous rendering: OK ({total:,} bytes/s, responsive input)')
     run_paint_case()
     print('PTY painting: OK (slow output, no full-screen clears, prompt Ctrl-C)')
     run_paint_case(stalled=True, partial_input=True)
