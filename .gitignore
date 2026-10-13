@@ -1,0 +1,14 @@
+# Build outputs and legacy executable locations.
+/builds/
+/tidepool
+/tidepool-linux-*
+/tests/unit
+*.o
+
+# Python test caches and local editor/OS files.
+__pycache__/
+*.py[cod]
+*.swp
+*.swo
+*~
+.DS_Store
