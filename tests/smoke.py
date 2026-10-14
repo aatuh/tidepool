@@ -195,14 +195,15 @@ def run_output_budget_case():
         os.close(slave)
 
 
-def run_palette_stack_case(entry, count, *, confirm=True, color='truecolor'):
+def run_palette_stack_case(entry, count, *, confirm=True, color='truecolor', generations=False):
     """Emulate the xterm handshake, including nested/full palette stacks."""
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 43, 149, 0, 0))
     original = termios.tcgetattr(slave)
     env = dict(os.environ, TERM='xterm', LC_ALL='C.UTF-8')
     program = subprocess.Popen(
-        [EXECUTABLE, '--color', color, '--seed', '1', '--fps', '30'],
+        [EXECUTABLE, '--color', color, '--seed', '1', '--fps', '30'] +
+        (['--generations', '--renewal', 'active'] if generations else []),
         stdin=slave, stdout=slave, stderr=slave, env=env,
         preexec_fn=take_terminal_control)
     try:
@@ -219,6 +220,8 @@ def run_palette_stack_case(entry, count, *, confirm=True, color='truecolor'):
         data = wait_for_output(master, b'tidepool / lagoon')
         optimized = pushed and confirm
         assert (b'\x1b]4;16;rgb:' in data) == optimized
+        if optimized and generations:
+            assert b';147;rgb:' in data, 'Generation color families were not installed'
         if optimized:
             # A paused repaint is bounded and contains indexed body colors.
             os.write(master, b' ')
@@ -339,6 +342,7 @@ def main():
     for entry, count, confirm in [(0, 0, True), (3, 8, True), (10, 10, True), (0, 0, False)]:
         run_palette_stack_case(entry, count, confirm=confirm)
     run_palette_stack_case(0, 0, color='auto')
+    run_palette_stack_case(0, 0, generations=True)
     print('PTY palette: OK (save/restore, theme, resize, nested/full stack, unsupported fallback)')
     total = run_output_budget_case()
     print(f'PTY continuous rendering: OK ({total:,} bytes/s, responsive input)')
@@ -358,16 +362,20 @@ def main():
         (['--ascii', '--color', '256', '--palette', 'orchid', '--no-mouse'], {'mouse': False, 'utf8': False}),
         (['--mono', '--no-mouse', '--no-hud'], {'mouse': False, 'utf8': False, 'resize': False}),
         (['--color', '16', '--seed', '42', '--renewal', 'active'], {'mouse': True, 'terminate': True}),
+        (['--generations', '--renewal', 'active', '--color', 'truecolor', '--seed', '1'], {'mouse': True}),
+        (['--generations', '--renewal', 'gentle', '--ascii', '--color', '256'], {'utf8': False}),
+        (['--generations', '--renewal', 'active', '--mono', '--no-mouse'], {'mouse': False, 'utf8': False}),
     ]:
         total_bytes = run_case(opts, **flags)
         print(f'PTY smoke: OK ({" ".join(opts)}; {total_bytes:,} bytes)')
     help_data = subprocess.run([EXECUTABLE,'--help'],capture_output=True,check=True).stdout
     assert b'tidepool' in help_data and b'--palette' in help_data and b'--no-mouse' in help_data
-    assert b'--renewal' in help_data and b'gentle' in help_data
+    assert b'--renewal' in help_data and b'gentle' in help_data and b'--generations' in help_data
     fail = subprocess.run([EXECUTABLE,'--fps','250'],capture_output=True)
     assert fail.returncode==2
     assert subprocess.run([EXECUTABLE, '--renewal', 'unknown'], capture_output=True).returncode == 2
     assert subprocess.run([EXECUTABLE, '--renewal'], capture_output=True).returncode == 2
+    assert subprocess.run([EXECUTABLE, '--generations=invalid'], capture_output=True).returncode == 2
     print('all PTY smoke tests: OK')
 
 

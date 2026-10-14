@@ -40,6 +40,7 @@ This Linux executable is not portable to macOS, BSD, or other CPU architectures;
 ```sh
 ./builds/tidepool --palette moss --layout fi --renewal gentle
 ./builds/tidepool --renewal active --palette lagoon
+./builds/tidepool --renewal active --generations
 ./builds/tidepool --palette orchid --color truecolor --fps 10
 ./builds/tidepool --ascii --color 256
 ./builds/tidepool --mono --no-mouse
@@ -79,6 +80,30 @@ stagnation. Default **off** preserves the unmodified mathematical model.
 Grazing runs in *simulation time*. The left/right speed keys also change how
 fast the grazers move and eat. Pausing freezes everything, including grazers.
 The same `--seed` and options reproduce the same evolution.
+
+### Generation colors
+
+Add `--generations` to color new growth after grazing:
+
+```sh
+./builds/tidepool --color truecolor --renewal active --generations
+./builds/tidepool --renewal gentle --generations
+```
+
+The initial garden uses the selected palette. A patch gains the next hue when
+it recovers after meaningful grazing; the hue persists, and new growth spreading
+into sparse areas inherits its parent's hue. Four hue families repeat across
+successive grazing-and-regrowth cycles. Brightness still shows chemical density,
+and empty areas share one dark background. Colors emerge gradually as grazing
+starts, with each patch changing independently as it regrows.
+
+Generation coloring does not change the chemistry, grazing, or seeded evolution.
+Pausing freezes generation tracking; painting still works. Resizing preserves
+the generation map, and Enter starts a new garden with the initial hue. With
+`--renewal off`, there is no grazing to create new generations. Truecolor shows
+the full color range; 256/16-color modes approximate it, and monochrome continues
+to show density without hue. The xterm renderer caches all four color families
+to keep painting responsive.
 
 ## Interaction
 

@@ -80,6 +80,99 @@ static void verify_options(void) {
     assert(parse_args(3,off,&c)==1 && c.renewal==RENEWAL_OFF);
     assert(parse_args(3,gentle,&c)==1 && c.renewal==RENEWAL_GENTLE);
     assert(parse_args(3,active,&c)==1 && c.renewal==RENEWAL_ACTIVE);
+    char *generations[] = {(char *)"tidepool",(char *)"--generations",
+        (char *)"--renewal",(char *)"active"};
+    assert(parse_args(4,generations,&c)==1 && c.generations && c.renewal==RENEWAL_ACTIVE);
+    assert(parse_args(1,off,&c)==1 && !c.generations);
+}
+
+static void verify_generation_lifecycle(void) {
+    App a = {0};
+    a.config.hud = 1; a.config.generations = 1; a.rng = 743927;
+    assert(garden_resize(&a,50,24));
+    Garden *g = &a.garden;
+    int center = 22*g->w+25;
+    for (int i = 0; i < g->w*g->h; ++i) {
+        g->u[i] = 1.f; g->v[i] = .25f;
+        memset(&g->generation[i],0,sizeof(Generation));
+    }
+    grazer_eat(g,25.f,22.f,.8f);
+    assert(g->generation[center].color == 0);
+    assert(g->generation[center].eaten >= GENERATION_DAMAGE);
+    for (int step = 0; step < 7; ++step) {
+        garden_step(g);
+        assert(g->generation[center].color == 0);
+    }
+    int recovered = 0;
+    for (int step = 0; step < 400; ++step) {
+        garden_step(g);
+        if (g->generation[center].color == 1) { recovered = 1; break; }
+    }
+    assert(recovered);
+    for (int step = 0; step < 100; ++step) garden_step(g);
+    assert(g->generation[center].color == 1);
+    assert(g->generation[center].eaten == 0.f);
+
+    /* Young growth inherits a donor's hue across the wrapping boundary;
+       surviving adult biomass retains its own generation. */
+    for (int i = 0; i < g->w*g->h; ++i) {
+        g->u[i] = 1.f; g->v[i] = 0.f;
+        memset(&g->generation[i],0,sizeof(Generation));
+    }
+    int donor = 10*g->w+g->w-1, young = 10*g->w, adult = donor-1;
+    g->v[donor] = .3f; g->generation[donor].color = 2;
+    g->v[adult] = .12f;
+    garden_step(g);
+    assert(g->v[young] > 0.f && g->generation[young].color == 2);
+    assert(g->generation[adult].color == 0);
+
+    for (int i = 0; i < g->w*g->h; ++i) {
+        g->v[i] = .2f;
+        g->generation[i].color = (unsigned char)(i%g->w < g->w/2 ? 1 : 3);
+        g->generation[i].eaten = .05f; g->generation[i].nadir = .18f;
+        g->generation[i].quiet = 5;
+    }
+    assert(garden_resize(&a,100,40));
+    g = &a.garden;
+    for (int i = 0; i < g->w*g->h; ++i) {
+        assert(g->generation[i].color == (i%g->w < g->w/2 ? 1 : 3));
+        assert(fabsf(g->generation[i].nadir-.18f) < .00001f);
+        assert(g->generation[i].quiet == 5);
+    }
+    garden_renew(&a);
+    for (int i = 0; i < g->w*g->h; ++i)
+        assert(g->generation[i].color == 0 && g->generation[i].eaten == 0.f);
+    assert(garden_resize(&a,20,5));
+    assert(!g->generation && !g->next_generation);
+    assert(garden_resize(&a,100,34));
+    assert(g->generation && g->next_generation);
+    garden_dispose(g);
+}
+
+static void verify_generation_chemistry(RenewalMode renewal) {
+    App original = {0}, colored = {0};
+    original.config.hud = colored.config.hud = 1;
+    original.config.renewal = colored.config.renewal = renewal;
+    colored.config.generations = 1;
+    original.rng = colored.rng = 743927;
+    assert(garden_resize(&original,100,34) && garden_resize(&colored,100,34));
+    size_t n = (size_t)original.garden.w*original.garden.h;
+    assert(!original.garden.generation);
+    for (int step = 0; step < 9000; ++step) {
+        garden_step(&original.garden); garden_ecology_step(&original);
+        garden_step(&colored.garden); garden_ecology_step(&colored);
+    }
+    assert(memcmp(original.garden.u,colored.garden.u,n*sizeof(float)) == 0);
+    assert(memcmp(original.garden.v,colored.garden.v,n*sizeof(float)) == 0);
+    assert(original.rng == colored.rng);
+    int colors = 0;
+    for (size_t i = 0; i < n; ++i) {
+        assert(colored.garden.generation[i].color < N_PALETTES);
+        colors |= 1 << colored.garden.generation[i].color;
+    }
+    if (renewal == RENEWAL_OFF) assert(colors == 1);
+    else assert((colors & ~1) != 0);
+    garden_dispose(&original.garden); garden_dispose(&colored.garden);
 }
 
 static void verify_exit_input(void) {
@@ -204,12 +297,47 @@ static void apply_frame_glyphs(const App *a, uint32_t *screen) {
         assert(screen[i] == a->garden.last[i].glyph);
 }
 
-static void verify_mature_renewal_paint_output(RenewalMode renewal) {
+static void verify_generation_rendering(void) {
+    for (int indexed = 0; indexed <= 1; ++indexed) {
+        App a = {0};
+        a.config.hud = 1; a.config.utf8 = 1; a.config.color = COLOR_TRUE;
+        a.config.generations = 1; a.indexed_colors = indexed; a.rng = 743927;
+        assert(garden_resize(&a,50,24));
+        Garden *g = &a.garden;
+        for (int i = 0; i < g->w*g->h; ++i) {
+            g->v[i] = .2f; g->trace[i] = 0.f;
+            g->generation[i].color = (unsigned char)(i%g->w < g->w/2 ? 0 : 1);
+        }
+        app_render(&a);
+        assert(g->last[0].bg != g->last[g->cols-1].bg);
+        uint32_t parent = g->last[0].bg;
+        g->generation[0].color = g->generation[g->w].color = 1;
+        a.output.len = 0; a.next_output_at = 0;
+        app_render(&a);
+        assert(g->last[0].bg != parent);
+        for (int i = 0; i < g->w*g->h; ++i) g->v[i] = .44f/(PALETTE_LEVELS*PALETTE_LEVELS);
+        a.output.len = 0; a.next_output_at = 0;
+        app_render(&a);
+        for (int i = 0; i < g->w*g->h; ++i) { g->v[i] = 0.f; g->trace[i] = 0.f; }
+        a.output.len = 0; a.next_output_at = 0;
+        app_render(&a);
+        for (int i = 0; i < g->cols*g->picture_rows; ++i) {
+            assert(g->last[i].bg == g->last[0].bg);
+            assert(g->last[i].glyph == ' ');
+        }
+        garden_dispose(g); installed_palette = -1;
+    }
+    /* Adjacent entries in different families must never hold an old hue. */
+    assert(stable_palette_color(indexed_shade(0,32),indexed_shade(1,1)) == indexed_shade(1,1));
+}
+
+static void verify_mature_renewal_paint_output(RenewalMode renewal, int generations) {
     App a = {0};
     a.config.hud = 1;
     a.config.utf8 = 1;
     a.config.color = COLOR_TRUE;
     a.config.renewal = renewal;
+    a.config.generations = generations;
     a.indexed_colors = 1;
     a.rng = 743927;
     make_keys(&a);
@@ -238,7 +366,7 @@ static void verify_mature_renewal_paint_output(RenewalMode renewal) {
         apply_frame_glyphs(&a,screen);
         bytes += a.output.len;
     }
-    printf("mature renewal %d with painting: %zu bytes/frame\n",renewal,bytes/120);
+    printf("mature renewal %d, generations %d with painting: %zu bytes/frame\n",renewal,generations,bytes/120);
     assert(bytes/120 < app_output_rate(&a)/30);
     free(screen);
     garden_dispose(&a.garden);
@@ -314,11 +442,18 @@ int main(void) {
     free(oldv);
     garden_dispose(&a.garden);
     verify_options();
+    verify_generation_lifecycle();
+    verify_generation_chemistry(RENEWAL_OFF);
+    verify_generation_chemistry(RENEWAL_GENTLE);
+    verify_generation_chemistry(RENEWAL_ACTIVE);
+    verify_generation_rendering();
     verify_exit_input();
     verify_nonblocking_render();
     verify_dense_paint_output();
-    verify_mature_renewal_paint_output(RENEWAL_GENTLE);
-    verify_mature_renewal_paint_output(RENEWAL_ACTIVE);
+    verify_mature_renewal_paint_output(RENEWAL_GENTLE,0);
+    verify_mature_renewal_paint_output(RENEWAL_ACTIVE,0);
+    verify_mature_renewal_paint_output(RENEWAL_GENTLE,1);
+    verify_mature_renewal_paint_output(RENEWAL_ACTIVE,1);
     float off_change = mature_change(RENEWAL_OFF);
     float gentle_change = mature_change(RENEWAL_GENTLE);
     float active_change = mature_change(RENEWAL_ACTIVE);

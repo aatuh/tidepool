@@ -35,6 +35,10 @@
 #define MIN_COLS 24
 #define MIN_ROWS 8
 #define MAX_GRAZERS 10
+#define GENERATION_DAMAGE .025f
+#define GENERATION_RECOVERY .025f
+#define GENERATION_ALIVE .10f
+#define GENERATION_QUIET_STEPS 8
 
 /* The nine-point Laplacian is less grid-directional than four neighbors. */
 #define DU .16f
@@ -57,7 +61,7 @@ typedef enum { LAYOUT_US, LAYOUT_FI } KeyLayout;
 typedef enum { RENEWAL_OFF, RENEWAL_GENTLE, RENEWAL_ACTIVE } RenewalMode;
 
 typedef struct {
-    int fps, mouse, hud, ascii, utf8;
+    int fps, mouse, hud, ascii, utf8, generations;
     ColorMode color;
     KeyLayout layout;
     int palette;
@@ -71,10 +75,15 @@ typedef struct {
     float x, y, direction, hunger;
 } Grazer;
 typedef struct { uint32_t fg, bg, glyph; } Cell;
+typedef struct {
+    float eaten, nadir;
+    unsigned char color, quiet;
+} Generation;
 typedef struct { char *bytes; size_t capacity, len; int failed; } Output;
 typedef struct {
     int cols, rows, w, h, picture_rows;
     float *u, *v, *next_u, *next_v, *trace;
+    Generation *generation, *next_generation;
     Cell *last;
     uint32_t *key_overlay;
     int redraw;
@@ -363,12 +372,26 @@ static RGB palette_sample(int palette, float v, float trace) {
     return palette_gradient(palette, palette_level(v, trace));
 }
 
-static void output_palette(Output *o, int palette) {
+static RGB generation_gradient(int palette, int color, int level) {
+    if (!color) return palette_gradient(palette,level);
+    int family = (palette+color)%N_PALETTES;
+    /* All generations share the empty garden's background. */
+    if (level < 6)
+        return mix_rgb(palettes[palette].stops[0],palette_gradient(family,6),(float)level/6.f);
+    return palette_gradient(family,level);
+}
+
+static uint32_t indexed_shade(int color, int level) {
+    return PALETTE_INDEXED | (uint32_t)(16+(level ? color*(PALETTE_LEVELS+1)+level : 0));
+}
+
+static void output_palette(Output *o, int palette, int generations) {
     output_str(o, "\033]4");
-    for (int level = 0; level <= PALETTE_LEVELS; ++level) {
-        RGB c = palette_gradient(palette, level);
-        output_fmt(o, ";%d;rgb:%02x/%02x/%02x", 16+level, c.r, c.g, c.b);
-    }
+    for (int color = 0; color < (generations ? N_PALETTES : 1); ++color)
+        for (int level = 0; level <= PALETTE_LEVELS; ++level) {
+            RGB c = generation_gradient(palette,color,level);
+            output_fmt(o, ";%d;rgb:%02x/%02x/%02x", 16+color*(PALETTE_LEVELS+1)+level, c.r, c.g, c.b);
+        }
     output_str(o, "\033\\");
 }
 
@@ -376,7 +399,47 @@ static void garden_dispose(Garden *g) {
     free(g->u); free(g->v); free(g->next_u); free(g->next_v);
     free(g->trace); free(g->last); free(g->key_overlay);
     free(g->frame_bytes);
+    free(g->generation); free(g->next_generation);
     memset(g, 0, sizeof(*g));
+}
+
+static void garden_generation_step(Garden *g, const float *before, const float *after) {
+    const int w = g->w, h = g->h;
+    for (int y = 0; y < h; ++y) {
+        int ay = (y ? y-1 : h-1)*w, by = (y+1 < h ? y+1 : 0)*w;
+        for (int x = 0; x < w; ++x) {
+            int i = y*w+x;
+            Generation c = g->generation[i];
+            int reborn = 0;
+            if (c.quiet) --c.quiet;
+            if (c.eaten > 0.f) {
+                c.nadir = fminf(c.nadir,after[i]);
+                if (c.eaten >= GENERATION_DAMAGE && !c.quiet &&
+                    after[i] >= GENERATION_ALIVE && after[i]-c.nadir >= GENERATION_RECOVERY) {
+                    c.color = (unsigned char)((c.color+1)%N_PALETTES);
+                    c.eaten = c.nadir = 0.f;
+                    reborn = 1;
+                }
+            }
+            /* Young growth inherits the strongest incoming V contribution.
+               Read the previous generation buffer to avoid scan-order bias. */
+            if (!reborn && before[i] < .08f && c.eaten < GENERATION_DAMAGE && after[i] > before[i]) {
+                int lx = x ? x-1 : w-1, rx = x+1 < w ? x+1 : 0;
+                int donors[8] = {y*w+lx,y*w+rx,ay+x,by+x,ay+lx,ay+rx,by+lx,by+rx};
+                float strongest = before[i]*(1.f-DV);
+                for (int k = 0; k < 8; ++k) {
+                    float contribution = before[donors[k]]*DV*(k < 4 ? .2f : .05f);
+                    if (contribution > strongest) {
+                        strongest = contribution;
+                        c.color = g->generation[donors[k]].color;
+                    }
+                }
+            }
+            g->next_generation[i] = c;
+        }
+    }
+    Generation *old = g->generation;
+    g->generation = g->next_generation; g->next_generation = old;
 }
 
 /* One deterministic Gray–Scott Euler step.  Toroidal boundaries avoid seams. */
@@ -402,6 +465,7 @@ static void garden_step(Garden *g) {
             nv[i] = clampf(vc + DV*lapv + reaction - (FEED+KILL)*vc, 0.f, 1.f);
         }
     }
+    if (g->generation) garden_generation_step(g,v,nv);
     g->u = nu; g->next_u = (float *)u;
     g->v = nv; g->next_v = (float *)v;
 }
@@ -500,6 +564,12 @@ static void grazer_eat(Garden *g, float x, float y, float strength) {
             float taken = g->v[i]*amount;
             g->v[i] -= taken;
             g->u[i] += (1.f-g->u[i])*amount*.6f;
+            if (g->generation && taken > .00005f) {
+                Generation *c = &g->generation[i];
+                c->nadir = c->eaten > 0.f ? fminf(c->nadir,g->v[i]) : g->v[i];
+                c->eaten = fminf(1.f,c->eaten+taken);
+                c->quiet = GENERATION_QUIET_STEPS;
+            }
         }
     }
 }
@@ -552,6 +622,10 @@ static void garden_renew(App *a) {
     for (size_t i = 0; i < n; ++i) {
         g->u[i] = 1.f; g->v[i] = 0.f;
         g->trace[i] = 0.f;
+    }
+    if (g->generation) {
+        memset(g->generation,0,n*sizeof(*g->generation));
+        memset(g->next_generation,0,n*sizeof(*g->next_generation));
     }
     /* Offset centers and scale seed size to fit even small terminals. */
     int count = g->w * g->h < 1000 ? 3 : 6;
@@ -698,13 +772,18 @@ static int garden_resize(App *a, int cols, int rows) {
     newg.next_u = calloc(n, sizeof(float));
     newg.next_v = calloc(n, sizeof(float));
     newg.trace = calloc(n, sizeof(float));
+    if (a->config.generations) {
+        newg.generation = calloc(n,sizeof(Generation));
+        newg.next_generation = calloc(n,sizeof(Generation));
+    }
     newg.last = malloc(pixels*sizeof(Cell));
     newg.key_overlay = calloc(pixels, sizeof(uint32_t));
     /* Each cell needs at most a cursor, two RGB controls, and a UTF-8 glyph. */
     newg.frame_capacity = pixels*64 + 4096;
     newg.frame_bytes = malloc(newg.frame_capacity);
     if (!newg.u || !newg.v || !newg.next_u || !newg.next_v ||
-        !newg.trace || !newg.last || !newg.key_overlay || !newg.frame_bytes) {
+        !newg.trace || !newg.last || !newg.key_overlay || !newg.frame_bytes ||
+        (a->config.generations && (!newg.generation || !newg.next_generation))) {
         garden_dispose(&newg); return 0;
     }
     for (size_t i = 0; i < pixels; ++i) {
@@ -735,6 +814,15 @@ static int garden_resize(App *a, int cols, int rows) {
                     +ty*((1-tx)*g->v[i01]+tx*g->v[i11]);
                 newg.trace[i] = (1-ty)*((1-tx)*g->trace[i00]+tx*g->trace[i10])
                     +ty*((1-tx)*g->trace[i01]+tx*g->trace[i11]);
+                if (newg.generation && g->generation) {
+                    int xx = ((int)floorf(fx+.5f)%g->w+g->w)%g->w;
+                    int yy = ((int)floorf(fy+.5f)%g->h+g->h)%g->h;
+                    int source = yy*g->w+xx;
+                    Generation c = g->generation[source];
+                    if (c.eaten > 0.f)
+                        c.nadir = clampf(c.nadir+newg.v[i]-g->v[source],0.f,1.f);
+                    newg.generation[i] = c;
+                }
             }
         }
     }
@@ -979,14 +1067,16 @@ static void app_footer(App *a, Output *o) {
             " left: bloom  right: soften  arrows: pace / color  space: pause");
         else snprintf(line, sizeof(line), " arrows: speed/color  enter: renew  esc: exit");
     } else if (g->cols >= 105) {
-        snprintf(line, sizeof(line), " tidepool / %-7s / %-10s %s  type or click to bloom   Tab keys   ? help   Esc leave",
+        snprintf(line, sizeof(line), " tidepool / %-7s / %-10s %s%s  type or click to bloom   Tab keys   ? help   Esc leave",
             pal, a->paused ? "paused" : speed_name(a->speed),
             a->config.renewal == RENEWAL_OFF ? "" :
-            a->config.renewal == RENEWAL_GENTLE ? "/ grazing" : "/ lively");
+            a->config.renewal == RENEWAL_GENTLE ? "/ grazing" : "/ lively",
+            a->config.generations ? " / generations" : "");
     } else if (g->cols >= 71) {
-        snprintf(line, sizeof(line), " tidepool / %s / %s%s   type / click   ? help",
+        snprintf(line, sizeof(line), " tidepool / %s / %s%s%s   type / click   ? help",
             pal, a->paused ? "paused" : speed_name(a->speed),
-            a->config.renewal == RENEWAL_OFF ? "" : " / grazing");
+            a->config.renewal == RENEWAL_OFF ? "" : " / grazing",
+            a->config.generations ? " / gen" : "");
     } else {
         snprintf(line, sizeof(line), " tidepool / %s / %s     ? help", pal,
             a->paused ? "paused" : speed_name(a->speed));
@@ -1009,7 +1099,10 @@ static uint32_t stable_palette_color(uint32_t before, uint32_t after) {
     /* Hold a one-shade change until it accumulates. Stabilize both colors
        before choosing the glyph, so tiny changes cannot alternate a solid
        space with a half-block and force an otherwise invisible repaint. */
+    if (after == indexed_shade(0,0)) return after;
     if ((before & after & PALETTE_INDEXED) &&
+        ((before & ~PALETTE_INDEXED)-16u)/(PALETTE_LEVELS+1) ==
+        ((after & ~PALETTE_INDEXED)-16u)/(PALETTE_LEVELS+1) &&
         abs((int)(before & ~PALETTE_INDEXED)-(int)(after & ~PALETTE_INDEXED)) <= 1)
         return before;
     return after;
@@ -1047,7 +1140,7 @@ static void app_render(App *a) {
     }
     if (g->redraw) garden_invalidate(g);
     if (a->indexed_colors && installed_palette != a->config.palette) {
-        output_palette(o, a->config.palette);
+        output_palette(o, a->config.palette, a->config.generations);
         a->output_palette = a->config.palette;
     }
     app_footer(a, o);
@@ -1063,13 +1156,19 @@ static void app_render(App *a) {
             Cell *prev = &g->last[y*g->cols+x];
             int top = (2*y)*g->w+x;
             int bottom = (2*y+1)*g->w+x;
-            RGB t = palette_sample(a->config.palette, g->v[top], g->trace[top]);
-            RGB b = palette_sample(a->config.palette, g->v[bottom], g->trace[bottom]);
+            int tc = g->generation ? g->generation[top].color : 0;
+            int bc = g->generation ? g->generation[bottom].color : 0;
+            int tl = palette_level(g->v[top],g->trace[top]);
+            int bl = palette_level(g->v[bottom],g->trace[bottom]);
+            RGB t = g->generation ? generation_gradient(a->config.palette,tc,tl) :
+                palette_sample(a->config.palette,g->v[top],g->trace[top]);
+            RGB b = g->generation ? generation_gradient(a->config.palette,bc,bl) :
+                palette_sample(a->config.palette,g->v[bottom],g->trace[bottom]);
             uint32_t fg = encode_color(t, a->config.color);
             uint32_t bg = encode_color(b, a->config.color);
             if (a->indexed_colors) {
-                fg = PALETTE_INDEXED | (uint32_t)(16+palette_level(g->v[top], g->trace[top]));
-                bg = PALETTE_INDEXED | (uint32_t)(16+palette_level(g->v[bottom], g->trace[bottom]));
+                fg = indexed_shade(tc,tl);
+                bg = indexed_shade(bc,bl);
                 if (prev->glyph != UINT32_MAX) {
                     if (fg == bg) {
                         bg = stable_palette_color(prev->bg,bg);
@@ -1091,6 +1190,13 @@ static void app_render(App *a) {
                 /* Text needs a readable foreground and a quiet solid backdrop. */
                 fg = encode_color(mix_rgb(t,b,.5f), a->config.color);
                 bg = encode_color(palettes[a->config.palette].stops[0], a->config.color);
+                if (g->generation && a->config.color != COLOR_MONO) {
+                    int color = g->v[top] >= g->v[bottom] ? tc : bc;
+                    int level = palette_level(concentration,(g->trace[top]+g->trace[bottom])*.5f);
+                    fg = a->indexed_colors ? indexed_shade(color,level) :
+                        encode_color(generation_gradient(a->config.palette,color,level),a->config.color);
+                    if (a->indexed_colors) bg = indexed_shade(0,0);
+                }
             }
             if (a->keys_visible && g->key_overlay[y*g->cols+x]) {
                 uint32_t cp = g->key_overlay[y*g->cols+x];
@@ -1172,6 +1278,7 @@ static void print_help(FILE *out) {
         "  --mono              ASCII without color\n"
         "  --fps N             Simulation rate 5–30 (default: 14)\n"
         "  --renewal MODE      off (default), gentle, active: local grazing\n"
+        "  --generations       Color regrowth after grazing (use with --renewal)\n"
         "  --seed N            Repeat a garden's initial random seed\n"
         "  --no-mouse          Don't enable terminal mouse reporting\n"
         "  --no-hud            Fill the bottom line with the garden\n"
@@ -1194,7 +1301,7 @@ static void print_help(FILE *out) {
 }
 
 static int parse_args(int argc, char **argv, Config *cfg) {
-    cfg->fps = 14; cfg->mouse = 1; cfg->hud = 1; cfg->ascii = 0;
+    cfg->fps = 14; cfg->mouse = 1; cfg->hud = 1; cfg->ascii = 0; cfg->generations = 0;
     cfg->color = COLOR_AUTO; cfg->layout = LAYOUT_US; cfg->palette = 0;
     cfg->seed = 0; cfg->seed_given = 0; cfg->renewal = RENEWAL_OFF;
     for (int i = 1; i < argc; ++i) {
@@ -1204,6 +1311,7 @@ static int parse_args(int argc, char **argv, Config *cfg) {
         else if (!strcmp(arg, "--mono")) { cfg->color = COLOR_MONO; cfg->ascii = 1; }
         else if (!strcmp(arg, "--no-mouse")) cfg->mouse = 0;
         else if (!strcmp(arg, "--no-hud")) cfg->hud = 0;
+        else if (!strcmp(arg, "--generations")) cfg->generations = 1;
         else if (!strcmp(arg, "--palette") && i+1 < argc) {
             ++i; int found = 0;
             for (int p = 0; p < N_PALETTES; ++p)
